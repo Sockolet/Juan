@@ -1,0 +1,88 @@
+[package]
+name = "juan"
+version = "0.3.1"
+edition = "2024"
+rust-version = "1.88"
+description = "A lightweight, native Windows HTTP(S) debugging proxy for support engineers"
+license = "MIT"
+repository = "https://github.com/Sockolet/Juan"
+readme = "README.md"
+default-run = "juan"
+build = "build.rs"
+
+[lib]
+name = "juan"
+path = "src/lib.rs"
+
+[[bin]]
+name = "juan"
+path = "src/main.rs"
+
+[[bin]]
+name = "juan-cli"
+path = "src/bin/juan-cli.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+brotli = "8"
+bytes = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+form_urlencoded = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "ring", "tls12", "rustls-platform-verifier"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "server-auto", "tokio"] }
+parking_lot = "0.12"
+quick-xml = "0.42"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem", "x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+x509-parser = "0.18"
+zeroize = "1"
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Networking_WinInet",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

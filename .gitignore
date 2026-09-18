@@ -1,0 +1,14 @@
+/target/
+/dist/
+*.har
+*.saz
+!/tests/fixtures/fiddler-reference.saz
+!/tests/fixtures/legacy-v02.saz
+*.pem
+*.key
+*.dpapi
+*.pdb
+.vs/
+.env
+.env.*
+!.env.example
