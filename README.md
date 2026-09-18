@@ -19,9 +19,6 @@ authority is now generated from the target URI by the HTTP client: `Host` for
 HTTP/1.x and `:authority` for HTTP/2, without an extra forwarded `Host` header.
 HTTP/2 and upstream certificate verification remain enabled.
 
-Version 0.3.0 renames the project from **Widdler to Juan**, including the desktop,
-CLI, Rust crate, assets, and archive producer identifiers.
-
 Version 0.2.0 adds native **SAZ import/export**, offline CLI inspection/conversion,
 and a SAZView-compatible HTML index. Binary and compressed body bytes, recorded
 timestamps, header values, trailers, session flags, and retention markers are
@@ -74,23 +71,6 @@ choice. Version 0.1.0 started only the listener.
 On Windows 10/11 x64, open `juan.exe` from the portable package. No installation,
 administrator rights, separate WebView runtime, or Visual C++ redistributable
 is required. The release build statically links the C runtime.
-
-### Upgrading from Widdler
-
-Juan migrates only `root-ca.dpapi` and `proxy-restore.dpapi` from
-`%LOCALAPPDATA%\Widdler` to `%LOCALAPPDATA%\Juan` on first use. The protected bytes
-are moved intact, not decrypted and reissued; other files in the old folder are
-left alone. Conflicting old/new state files stop migration rather than overwrite
-either copy. Do not delete CA state while its certificate is still trusted.
-
-Existing CA certificates keep their original **Widdler Local Debugging CA**
-subject and fingerprint, preserving previously configured trust. New CAs use
-**Juan Local Debugging CA**. The rename itself never installs or removes trust.
-Juan and legacy Widdler share an instance guard and cannot capture concurrently.
-
-Old SAZ files with `x-widdler-*` metadata remain readable. New SAZ files use
-`x-juan-*`, and new HAR exports use `_juan` metadata. Historical comments and
-archive contents are not rewritten simply to remove the old name.
 
 Locally built executables are in:
 
