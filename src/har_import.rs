@@ -240,11 +240,24 @@ pub fn read(source: impl Read, limits: CaptureLimits) -> Result<ImportedArchive>
             && limits.total_body_bytes >= limits.body_bytes,
         "Invalid HAR retention limits"
     );
-    // Convert one entry at a time rather than retaining the entire JSON capture.
-    let mut parser = serde_json::Deserializer::from_reader(BufReader::new(Bounded {
+    let mut source = Bounded {
         source,
         remaining: INPUT_LIMIT,
-    }));
+    };
+    let mut prefix = Vec::with_capacity(3);
+    source
+        .by_ref()
+        .take(3)
+        .read_to_end(&mut prefix)
+        .context("Read HAR prefix")?;
+    // Only a leading UTF-8 BOM is optional. Its bytes still consume the input budget.
+    if prefix == b"\xef\xbb\xbf" {
+        prefix.clear();
+    }
+    // Convert one entry at a time rather than retaining the entire JSON capture.
+    let mut parser = serde_json::Deserializer::from_reader(BufReader::new(
+        std::io::Cursor::new(prefix).chain(source),
+    ));
     let imported = RootSeed(limits)
         .deserialize(&mut parser)
         .context("Parse HAR 1.2")?;

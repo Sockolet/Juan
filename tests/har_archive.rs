@@ -270,11 +270,50 @@ fn limits_1000_entries_are_inclusive_no_silent_skips() {
 #[test]
 fn input_boundary_is_exactly_128_mib_and_reader_does_not_trust_file_metadata() {
     assert_eq!(INPUT_LIMIT, 134217728);
-    for extra in [0, 1] {
-        let source = Cursor::new(CHROME)
-            .chain(std::io::repeat(b' ').take(INPUT_LIMIT - CHROME.len() as u64 + extra));
-        let result = har_import::read(source, CaptureLimits::default());
-        assert_eq!(result.is_ok(), extra == 0, "{result:?}");
+    for prefix in [b"".as_slice(), b"\xef\xbb\xbf".as_slice()] {
+        for extra in [0, 1] {
+            let source = Cursor::new(prefix).chain(Cursor::new(CHROME)).chain(
+                std::io::repeat(b' ')
+                    .take(INPUT_LIMIT - prefix.len() as u64 - CHROME.len() as u64 + extra),
+            );
+            let result = har_import::read(source, CaptureLimits::default());
+            assert_eq!(result.is_ok(), extra == 0, "{result:?}");
+        }
+    }
+}
+
+#[test]
+fn optional_utf8_bom_is_only_consumed_at_start_even_with_short_reads() {
+    const BOM_HAR: &[u8] = include_bytes!("fixtures/har/utf8-bom.har");
+    assert!(BOM_HAR.starts_with(b"\xef\xbb\xbf"));
+    struct ShortReads<'a>(&'a [u8]);
+    impl Read for ShortReads<'_> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let length = output.len().min(1);
+            self.0.read(&mut output[..length])
+        }
+    }
+    for input in [BOM_HAR, &BOM_HAR[3..]] {
+        let imported = har_import::read(ShortReads(input), CaptureLimits::default()).unwrap();
+        assert_eq!(
+            imported.sessions[0].response.data,
+            "\u{feff}body BOM is evidence".as_bytes()
+        );
+        assert_eq!(imported.sessions[0].url, "https://example.test/bom");
+    }
+    for prefix in [
+        b" \xef\xbb\xbf".as_slice(),
+        b"\xef\xbb\xbf\xef\xbb\xbf",
+        b"\xef\xbb",
+        b"\xff\xfe",
+    ] {
+        assert!(
+            har_import::read(
+                Cursor::new(prefix).chain(Cursor::new(CHROME)),
+                CaptureLimits::default()
+            )
+            .is_err()
+        );
     }
 }
 
