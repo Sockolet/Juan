@@ -138,6 +138,39 @@ function Assert-That([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
 
+function Assert-RenderedErrorText([IntPtr]$List, [string]$Name, [string]$Directory) {
+    $bounds = [JuanUiSmoke+RECT]::new()
+    Assert-That ([JuanUiSmoke]::GetWindowRect($List, [ref]$bounds)) 'Cannot measure synthetic list.'
+    $image = [System.Drawing.Bitmap]::new($bounds.Right - $bounds.Left, $bounds.Bottom - $bounds.Top)
+    $graphics = [System.Drawing.Graphics]::FromImage($image)
+    try {
+        $dc = $graphics.GetHdc()
+        try { Assert-That ([JuanUiSmoke]::PrintWindow($List, $dc, 0)) 'Cannot render native error list.' }
+        finally { $graphics.ReleaseHdc($dc) }
+        $image.Save((Join-Path $Directory "$Name.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+        $left = 2
+        # Check real glyph pixels in ID, numeric status (excluding icon), method,
+        # protocol and host. Pale backgrounds and the error icon cannot pass.
+        for ($column = 0; $column -lt 5; $column++) {
+            $width = [JuanUiSmoke]::Send($List, 4125, [IntPtr]::new($column), [IntPtr]::Zero).ToInt32()
+            $right = [Math]::Min($left + $width - 3, $image.Width - 3)
+            if ($column -eq 1) { $right -= [Math]::Ceiling($width * 0.35) }
+            $red = 0
+            for ($x = $left + 2; $x -lt $right; $x++) {
+                for ($y = 2; $y -lt $image.Height - 2; $y++) {
+                    $pixel = $image.GetPixel($x, $y)
+                    if ($pixel.R -ge 140 -and $pixel.G -lt 110 -and $pixel.B -lt 110) { $red++ }
+                }
+            }
+            Assert-That ($red -ge 5) "$Name column $column has no red foreground glyphs; see native screenshot."
+            $left += $width
+        }
+    } finally {
+        $graphics.Dispose()
+        $image.Dispose()
+    }
+}
+
 function Wait-Until([scriptblock]$Condition, [string]$Failure) {
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     while ($watch.Elapsed.TotalSeconds -lt 10) {
@@ -355,6 +388,15 @@ try {
         [void][JuanUiSmoke]::Send($hide, 245, [IntPtr]::Zero, [IntPtr]::Zero)
         Wait-Until { (Get-RowCount $list) -eq 10 } 'Asset toggle did not hide exactly CSS/JS/image successes.'
         Assert-That ((Get-ControlText $hide).Contains('3 hidden')) 'Hidden count is incorrect.'
+        $renderDirectory = Join-Path (Split-Path -Parent $Executable) 'synthetic-error-render'
+        [void][System.IO.Directory]::CreateDirectory($renderDirectory)
+        foreach ($probe in @(@('status:400','http400'), @('status:500','http500'), @('transport','transport'))) {
+            Set-ControlText $search $probe[0]
+            Wait-Until { (Get-RowCount $list) -eq 1 } 'Synthetic error probe did not isolate one row.'
+            Assert-RenderedErrorText $list $probe[1] $renderDirectory
+        }
+        Set-ControlText $search ''
+        Wait-Until { (Get-RowCount $list) -eq 10 } 'Could not restore synthetic rows after rendering checks.'
         Assert-That ((Get-ControlText $review).Contains('6 visible')) 'Review counts should include errors only, not missing bodies.'
         $scopeControl = [JuanUiSmoke]::GetDlgItem($window,109)
         [void][JuanUiSmoke]::Send($scopeControl,334,[IntPtr]::new(4),[IntPtr]::Zero)
@@ -445,7 +487,9 @@ try {
         Invoke-CommandId $window 219
         Assert-That ((Get-ControlText $findInfo).Contains('Select a session')) 'Find did not handle a filtered-away selection safely.'
         Set-ControlText $search ''
-        Wait-Until { (Get-RowCount $list) -eq 13 } 'Restore did not preserve all original sessions.'
+        Wait-Until { (Get-RowCount $list) -eq 10 } 'Clearing the filter changed the asset checkbox.'
+        [void][JuanUiSmoke]::Send($hide, 245, [IntPtr]::Zero, [IntPtr]::Zero)
+        Wait-Until { (Get-RowCount $list) -eq 13 } 'Unchecking Hide assets did not preserve all original sessions.'
         Assert-That ((Get-ControlText ([JuanUiSmoke]::GetDlgItem($window,100))) -eq 'Start capture') 'Troubleshooting started capture.'
         Write-Output 'Troubleshooting UI smoke passed: default assets checkbox/count, no Restore button, visible-scope review/navigation, Unicode message find/case/next/previous/wrap/Enter/Escape, filter switching, no capture.'
         return

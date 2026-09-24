@@ -237,6 +237,8 @@ and arbitrary query expressions are not implemented.
 - **Result** retains the numeric status and numeric sorting, with a compact native
   error icon (no emoji font required). Every HTTP 4xx, including 400, every 5xx,
   and recorded transport/source failure receives red whole-row emphasis.
+  Unselected error cells explicitly draw their foreground text in red, skipping
+  the themed default text pass. This is not only a background tint or status icon.
   Hover a row or inspect its response/timing details for concise explanations such
   as `400 Bad Request`. Authentication challenges (401/407) may be expected.
   Selected rows keep native selection colors; high-contrast rows use system colors.

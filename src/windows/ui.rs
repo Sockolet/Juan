@@ -2264,8 +2264,23 @@ impl App {
                             CDDS_PREPAINT => return Some(CDRF_NOTIFYITEMDRAW as isize),
                             CDDS_ITEMPREPAINT => return Some(CDRF_NOTIFYSUBITEMDRAW as isize),
                             stage if stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM => {
+                                let selected = SendMessageW(
+                                    c.list,
+                                    LVM_GETITEMSTATE,
+                                    draw.nmcd.dwItemSpec,
+                                    LVIS_SELECTED as isize,
+                                ) & LVIS_SELECTED as isize
+                                    != 0;
+                                if !selected
+                                    && let Some(row) = self.rows.borrow().get(draw.nmcd.dwItemSpec)
+                                    && troubleshoot::problem_marker(row)
+                                    && draw_error_cell(c.list, draw, row, self.dpi.get())
+                                {
+                                    // Explorer's themed default pass must not repaint our red glyphs.
+                                    return Some(CDRF_SKIPDEFAULT as isize);
+                                }
                                 if let Some(row) = self.rows.borrow().get(draw.nmcd.dwItemSpec)
-                                    && draw.nmcd.uItemState & CDIS_SELECTED == 0
+                                    && !selected
                                 {
                                     let problem = problem_row_colors(row, false, false);
                                     draw.clrTextBk = if let Some((_, background)) = problem {
@@ -2290,9 +2305,9 @@ impl App {
                                     };
                                 }
                                 return Some(if draw.iSubItem == 1 {
-                                    CDRF_NOTIFYPOSTPAINT as isize
+                                    (CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT) as isize
                                 } else {
-                                    CDRF_DODEFAULT as isize
+                                    CDRF_NEWFONT as isize
                                 });
                             }
                             _ => {}
@@ -2832,6 +2847,82 @@ fn problem_row_colors(
         .then_some((RED, rgb(255, 238, 238)))
 }
 
+fn draw_error_cell(list: HWND, draw: &NMLVCUSTOMDRAW, row: &SessionSummary, dpi: u32) -> bool {
+    let column = draw.iSubItem;
+    if column < 0 || column as usize >= COLUMNS.len() {
+        return false;
+    }
+    // SAFETY: The list and paint DC are live during NM_CUSTOMDRAW. Buffers are local;
+    // the saved DC is restored and the only owned GDI brush is deleted before return.
+    unsafe {
+        let mut bounds = RECT {
+            top: column,
+            left: LVIR_BOUNDS as i32,
+            ..Default::default()
+        };
+        if SendMessageW(
+            list,
+            LVM_GETSUBITEMRECT,
+            draw.nmcd.dwItemSpec,
+            &mut bounds as *mut RECT as isize,
+        ) == 0
+        {
+            return false;
+        }
+        // Subitem zero's bounds cover the entire row, unlike the other subitems.
+        if column == 0 {
+            bounds.right = bounds.left + SendMessageW(list, LVM_GETCOLUMNWIDTH, 0, 0) as i32;
+        }
+        let dc = draw.nmcd.hdc;
+        let saved = SaveDC(dc);
+        if saved == 0 {
+            return false;
+        }
+        IntersectClipRect(dc, bounds.left, bounds.top, bounds.right, bounds.bottom);
+        let brush = CreateSolidBrush(rgb(255, 238, 238));
+        if brush.is_null() {
+            RestoreDC(dc, saved);
+            return false;
+        }
+        FillRect(dc, &bounds, brush);
+        DeleteObject(brush);
+        let font = SendMessageW(list, WM_GETFONT, 0, 0) as HFONT;
+        if !font.is_null() {
+            SelectObject(dc, font);
+        }
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(dc, RED);
+        let mut text_bounds = bounds;
+        text_bounds.left += scaled(6, dpi);
+        text_bounds.right -= scaled(6, dpi);
+        if column == 1 && bounds.right - bounds.left >= scaled(64, dpi) {
+            let size = scaled(16, dpi).min(bounds.bottom - bounds.top);
+            text_bounds.right -= size + scaled(4, dpi);
+            DrawIconEx(
+                dc,
+                bounds.right - size - scaled(6, dpi),
+                bounds.top + (bounds.bottom - bounds.top - size) / 2,
+                LoadIconW(null_mut(), IDI_ERROR),
+                size,
+                size,
+                0,
+                null_mut(),
+                DI_NORMAL,
+            );
+        }
+        let text = wide(&cell_text(row, column as usize));
+        DrawTextW(
+            dc,
+            text.as_ptr(),
+            (text.len() - 1) as i32,
+            &mut text_bounds,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        RestoreDC(dc, saved);
+        true
+    }
+}
+
 fn cell_text(row: &SessionSummary, column: usize) -> String {
     match column {
         0 => row.id.to_string(),
@@ -2994,7 +3085,7 @@ mod capture_start_tests {
         let rows: Vec<_> = imported.sessions.iter().map(|s| s.summary()).collect();
         assert_eq!(cell_text(&rows[5], 1), "403");
         assert_eq!(cell_text(&rows[6], 1), "429");
-        assert_eq!(cell_text(&rows[7], 1), "503");
+        assert_eq!(cell_text(&rows[7], 1), "500");
         assert_eq!(cell_text(&rows[8], 1), "401");
         assert_eq!(cell_text(&rows[10], 1), "200");
         assert!(troubleshoot::reason(&rows[9]).contains("recorded transport/source error"));
