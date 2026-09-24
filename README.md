@@ -226,16 +226,19 @@ and arbitrary query expressions are not implemented.
 
 ### Troubleshooting views
 
-- **Hide assets** is opt-in and resets off on archive import. It hides only settled,
+- **Hide assets** is checked by default, including after archive import. It hides only settled,
   successful GET/HEAD responses with recognized CSS, JavaScript or common image
   MIME types (including 304 cache responses). URL suffixes are never sufficient.
   Failures, incomplete requests, missing/ambiguous MIME types and POSTs remain
   visible. Conflicting Content-Type headers or HAR MIME metadata prevent hiding.
-  **Restore assets** shows the hidden count within the current filter/scope and
-  restores those rows without clearing your other filters. Nothing is deleted.
-- **Result / review** includes text labels, not just color. Recorded transport/source
-  errors and 5xx rows receive red emphasis; 403, 429, authentication challenges
-  (401/407) and other 4xx have distinct review labels. A challenge can be expected.
+  Its compact caption reports the hidden count within the current filter/scope.
+  Uncheck this sole visibility control to restore assets without clearing other
+  filters. There is no separate Restore button or menu action. Nothing is deleted.
+- **Result** retains the numeric status and numeric sorting, with a compact native
+  error icon (no emoji font required). Every HTTP 4xx, including 400, every 5xx,
+  and recorded transport/source failure receives red whole-row emphasis.
+  Hover a row or inspect its response/timing details for concise explanations such
+  as `400 Bad Request`. Authentication challenges (401/407) may be expected.
   Selected rows keep native selection colors; high-contrast rows use system colors.
   Missing response bodies alone are not errors.
 - **Review first** counts only visible candidates. Clicking cycles deterministically
@@ -574,6 +577,8 @@ Package a portable ZIP and SHA-256 checksum:
 
 ```powershell
 .\scripts\package.ps1
+# Keep a corrected preview separate from existing portable packages:
+.\scripts\package.ps1 -PackageName juan-0.3.1-ui-corrections-preview-20260924
 ```
 
 Artifacts go to `dist`. GitHub Actions is configured to format-check, lint, test,

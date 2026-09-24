@@ -36,8 +36,7 @@ use crate::{
     har::ExportMode,
     inspect::{self, Inspector},
     proxy::{self, ProxyConfig, ProxyHandle},
-    saz,
-    troubleshoot::{self, Review},
+    saz, troubleshoot,
 };
 
 const CAPTURE: u16 = 100;
@@ -73,7 +72,6 @@ const IMPORT_SAZ: u16 = 210;
 const EXPORT_SAZ: u16 = 211;
 const EXPORT_SAZ_SANITIZED: u16 = 212;
 const HIDE_ASSETS: u16 = 213;
-const RESTORE_ASSETS: u16 = 214;
 const REVIEW_FIRST: u16 = 215;
 const FIND: u16 = 216;
 const FIND_QUERY: u16 = 217;
@@ -101,7 +99,7 @@ enum HttpsTrust {
 
 const COLUMNS: [(&str, i32); 9] = [
     ("#", 42),
-    ("Result / review", 245),
+    ("Result", 88),
     ("Method", 76),
     ("Protocol", 70),
     ("Host", 166),
@@ -113,7 +111,6 @@ const COLUMNS: [(&str, i32); 9] = [
 
 struct Controls {
     hide_assets: HWND,
-    restore_assets: HWND,
     review: HWND,
     find_query: HWND,
     find_case: HWND,
@@ -144,10 +141,9 @@ struct Controls {
 }
 
 impl Controls {
-    fn all(&self) -> [HWND; 29] {
+    fn all(&self) -> [HWND; 28] {
         [
             self.hide_assets,
-            self.restore_assets,
             self.review,
             self.find_query,
             self.find_case,
@@ -242,7 +238,7 @@ impl App {
             demo::populate(&store);
         }
         Ok(Self {
-            hide_assets: Cell::new(false),
+            hide_assets: Cell::new(troubleshoot::HIDE_ASSETS_DEFAULT),
             review_cursor: Cell::new(None),
             find_open: Cell::new(false),
             find_target: Cell::new(1),
@@ -342,7 +338,6 @@ impl App {
         let tabs = |id| child(parent, "SysTabControl32", "", WS_TABSTOP, 0, id);
         let controls = Controls {
             hide_assets: checkbox("Hide assets", HIDE_ASSETS)?,
-            restore_assets: button("Restore assets (0 hidden)", RESTORE_ASSETS)?,
             review: button("Review first (0 visible)", REVIEW_FIRST)?,
             find_query: child(
                 parent,
@@ -469,6 +464,7 @@ impl App {
                     wide(value).as_ptr() as isize,
                 );
             }
+            set_checked(controls.hide_assets, self.hide_assets.get());
             SendMessageW(controls.scope, CB_SETCURSEL, 0, 0);
             SendMessageW(
                 controls.search,
@@ -584,10 +580,21 @@ impl App {
         position(c.autoscroll, width - s(126), s(84), s(114), s(32));
         position(c.search, s(16), s(151), split - s(174), s(29));
         position(c.scope, split - s(150), s(150), s(138), s(240));
-        position(c.hide_assets, s(16), s(183), s(112), s(26));
-        position(c.restore_assets, s(133), s(183), split - s(145), s(26));
-        position(c.review, s(16), s(213), split - s(27), s(29));
-        position(c.list, s(16), s(248), split - s(27), height - s(291));
+        position(c.hide_assets, s(16), s(183), s(220), s(26));
+        let list_top = if split >= s(460) {
+            position(c.review, s(242), s(183), split - s(253), s(29));
+            218
+        } else {
+            position(c.review, s(16), s(213), split - s(27), s(29));
+            248
+        };
+        position(
+            c.list,
+            s(16),
+            s(list_top),
+            split - s(27),
+            height - s(list_top + 43),
+        );
         position(
             c.main_tabs,
             split + s(14),
@@ -733,10 +740,8 @@ impl App {
             return Ok(());
         };
         match id {
-            HIDE_ASSETS | RESTORE_ASSETS => {
-                self.hide_assets
-                    .set(id == HIDE_ASSETS && checked(c.hide_assets));
-                set_checked(c.hide_assets, self.hide_assets.get());
+            HIDE_ASSETS => {
+                self.hide_assets.set(checked(c.hide_assets));
                 self.review_cursor.set(None);
                 self.refresh(true);
             }
@@ -1393,12 +1398,12 @@ impl App {
                 .map(|session| session.id),
         );
         *self.filter.borrow_mut() = Filter::default();
-        self.hide_assets.set(false);
+        self.hide_assets.set(troubleshoot::HIDE_ASSETS_DEFAULT);
         self.review_cursor.set(None);
         self.filter_error.borrow_mut().take();
         self.scope.set(0);
         if let Some(c) = self.controls.get() {
-            set_checked(c.hide_assets, false);
+            set_checked(c.hide_assets, self.hide_assets.get());
             // SAFETY: The selection change targets our live native combo box and retains no pointers.
             unsafe {
                 SendMessageW(c.scope, CB_SETCURSEL, 0, 0);
@@ -1534,21 +1539,9 @@ impl App {
                 })
                 .collect()
         };
-        set_text(
-            c.restore_assets,
-            &format!("Restore assets ({hidden} hidden in scope)"),
-        );
-        enable(c.restore_assets, self.hide_assets.get());
+        set_text(c.hide_assets, &format!("Hide assets ({hidden} hidden)"));
         let order = troubleshoot::review_order(&rows);
-        let reason = order
-            .first()
-            .and_then(|id| rows.iter().find(|r| r.id == *id))
-            .and_then(Review::of)
-            .map_or("No flagged responses", Review::label);
-        set_text(
-            c.review,
-            &format!("Review first ({} visible): {reason}", order.len()),
-        );
+        set_text(c.review, &format!("Review first ({} visible)", order.len()));
         enable(c.review, !order.is_empty());
         let (column, ascending) = self.sort.get();
         rows.sort_by(|a, b| {
@@ -1634,7 +1627,11 @@ impl App {
                 String::new()
             };
             let detail = if self.main_tab.get() == 1 {
-                inspect::render_timing(&session)
+                format!(
+                    "STATUS: {}\r\nRed/marker indicates recorded status or failure, not a root-cause diagnosis.\r\n\r\n{}",
+                    troubleshoot::reason(&session.summary()),
+                    inspect::render_timing(&session)
+                )
             } else {
                 inspect::render_notices(&self.store.notices())
             };
@@ -1645,9 +1642,7 @@ impl App {
             );
             let response_info = format!(
                 "{}  /  {}  /  {}",
-                session
-                    .status
-                    .map_or(String::from("Pending"), |s| s.to_string()),
+                troubleshoot::reason(&session.summary()),
                 inspect::bytes_label(session.response.total_bytes),
                 session
                     .elapsed_ms()
@@ -2126,6 +2121,17 @@ impl App {
             let header = &*(lparam as *const NMHDR);
             if header.hwndFrom == c.list {
                 match header.code {
+                    LVN_GETINFOTIPW => {
+                        let info = &mut *(lparam as *mut NMLVGETINFOTIPW);
+                        if let Some(row) = self.rows.borrow().get(info.iItem as usize) {
+                            copy_wide(
+                                &troubleshoot::reason(row),
+                                info.pszText,
+                                info.cchTextMax.max(0) as usize,
+                            );
+                        }
+                        return Some(0);
+                    }
                     LVN_GETDISPINFOW => {
                         let info = &mut *(lparam as *mut NMLVDISPINFOW);
                         if info.item.mask & LVIF_TEXT != 0 {
@@ -2198,34 +2204,81 @@ impl App {
                         {
                             draw.clrText = GetSysColor(COLOR_WINDOWTEXT);
                             draw.clrTextBk = GetSysColor(COLOR_WINDOW);
-                            return Some(CDRF_DODEFAULT as isize);
+                            return Some(if draw.iSubItem == 1 {
+                                CDRF_NOTIFYPOSTPAINT as isize
+                            } else {
+                                CDRF_DODEFAULT as isize
+                            });
                         }
                         match draw.nmcd.dwDrawStage {
+                            stage if stage == CDDS_ITEMPOSTPAINT | CDDS_SUBITEM => {
+                                if draw.iSubItem == 1
+                                    && self
+                                        .rows
+                                        .borrow()
+                                        .get(draw.nmcd.dwItemSpec)
+                                        .is_some_and(troubleshoot::problem_marker)
+                                {
+                                    let mut bounds = RECT {
+                                        top: 1,
+                                        left: LVIR_BOUNDS as i32,
+                                        ..Default::default()
+                                    };
+                                    if SendMessageW(
+                                        c.list,
+                                        LVM_GETSUBITEMRECT,
+                                        draw.nmcd.dwItemSpec,
+                                        &mut bounds as *mut RECT as isize,
+                                    ) != 0
+                                        && bounds.right - bounds.left >= self.s(64)
+                                    {
+                                        let size = self.s(16).min(bounds.bottom - bounds.top);
+                                        let saved = SaveDC(draw.nmcd.hdc);
+                                        if saved != 0 {
+                                            IntersectClipRect(
+                                                draw.nmcd.hdc,
+                                                bounds.left,
+                                                bounds.top,
+                                                bounds.right,
+                                                bounds.bottom,
+                                            );
+                                            // Shared stock icon: no font dependency or owned handle to destroy.
+                                            DrawIconEx(
+                                                draw.nmcd.hdc,
+                                                bounds.right - size - self.s(6),
+                                                bounds.top
+                                                    + (bounds.bottom - bounds.top - size) / 2,
+                                                LoadIconW(null_mut(), IDI_ERROR),
+                                                size,
+                                                size,
+                                                0,
+                                                null_mut(),
+                                                DI_NORMAL,
+                                            );
+                                            RestoreDC(draw.nmcd.hdc, saved);
+                                        }
+                                    }
+                                }
+                                return Some(CDRF_DODEFAULT as isize);
+                            }
                             CDDS_PREPAINT => return Some(CDRF_NOTIFYITEMDRAW as isize),
                             CDDS_ITEMPREPAINT => return Some(CDRF_NOTIFYSUBITEMDRAW as isize),
                             stage if stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM => {
                                 if let Some(row) = self.rows.borrow().get(draw.nmcd.dwItemSpec)
                                     && draw.nmcd.uItemState & CDIS_SELECTED == 0
                                 {
-                                    let review = Review::of(row);
-                                    draw.clrTextBk = if review.is_some_and(Review::urgent) {
-                                        rgb(255, 238, 238)
+                                    let problem = problem_row_colors(row, false, false);
+                                    draw.clrTextBk = if let Some((_, background)) = problem {
+                                        background
                                     } else if draw.nmcd.dwItemSpec.is_multiple_of(2) {
                                         WHITE
                                     } else {
                                         rgb(249, 251, 252)
                                     };
-                                    draw.clrText = if review.is_some_and(Review::urgent) {
-                                        RED
+                                    draw.clrText = if let Some((foreground, _)) = problem {
+                                        foreground
                                     } else if draw.iSubItem == 1 {
-                                        if review.is_some() {
-                                            AMBER
-                                        } else if row.is_error() {
-                                            RED
-                                        } else if row
-                                            .status
-                                            .is_some_and(|s| (300..400).contains(&s))
-                                        {
+                                        if row.status.is_some_and(|s| (300..400).contains(&s)) {
                                             AMBER
                                         } else {
                                             ACCENT
@@ -2236,7 +2289,11 @@ impl App {
                                         TEXT
                                     };
                                 }
-                                return Some(CDRF_DODEFAULT as isize);
+                                return Some(if draw.iSubItem == 1 {
+                                    CDRF_NOTIFYPOSTPAINT as isize
+                                } else {
+                                    CDRF_DODEFAULT as isize
+                                });
                             }
                             _ => {}
                         }
@@ -2766,16 +2823,16 @@ fn find_enter_search_control(id: i32) -> bool {
         .any(|control| i32::from(control) == id)
 }
 
+fn problem_row_colors(
+    row: &SessionSummary,
+    selected: bool,
+    high_contrast: bool,
+) -> Option<(u32, u32)> {
+    (troubleshoot::problem_marker(row) && !selected && !high_contrast)
+        .then_some((RED, rgb(255, 238, 238)))
+}
+
 fn cell_text(row: &SessionSummary, column: usize) -> String {
-    if column == 1
-        && let Some(review) = Review::of(row)
-    {
-        return format!(
-            "{} | {}",
-            row.status.map_or("-".into(), |s| s.to_string()),
-            review.label()
-        );
-    }
     match column {
         0 => row.id.to_string(),
         1 => row.status.map_or(
@@ -2860,7 +2917,6 @@ fn make_menu() -> Result<HMENU> {
                         (FIND_PREVIOUS, "Previous message match\tShift+F3"),
                         (0, ""),
                         (REVIEW_FIRST, "Review next visible candidate"),
-                        (RESTORE_ASSETS, "Restore hidden assets"),
                     ],
                 ),
                 (
@@ -2929,22 +2985,38 @@ mod capture_start_tests {
     }
 
     #[test]
-    fn problem_cells_explain_status_without_claiming_causes_or_missing_body_errors() {
+    fn problem_cells_are_compact_with_reasons_in_details_and_accessible_colors() {
         let imported = crate::har_import::read(
             include_bytes!("../../tests/fixtures/har/troubleshooting.har").as_slice(),
             crate::capture::CaptureLimits::default(),
         )
         .unwrap();
         let rows: Vec<_> = imported.sessions.iter().map(|s| s.summary()).collect();
-        assert!(cell_text(&rows[5], 1).contains("403: review access"));
-        assert!(cell_text(&rows[6], 1).contains("429: review throttling"));
-        assert!(cell_text(&rows[7], 1).contains("5xx: review server response"));
-        assert!(cell_text(&rows[8], 1).contains("Auth challenge: may be expected"));
-        assert!(cell_text(&rows[9], 1).contains("Recorded transport/source error"));
+        assert_eq!(cell_text(&rows[5], 1), "403");
+        assert_eq!(cell_text(&rows[6], 1), "429");
+        assert_eq!(cell_text(&rows[7], 1), "503");
+        assert_eq!(cell_text(&rows[8], 1), "401");
         assert_eq!(cell_text(&rows[10], 1), "200");
-        assert!(Review::of(&rows[7]).unwrap().urgent());
-        assert!(Review::of(&rows[9]).unwrap().urgent());
-        assert!(!Review::of(&rows[8]).unwrap().urgent());
+        assert!(troubleshoot::reason(&rows[9]).contains("recorded transport/source error"));
+        for row in &rows {
+            assert_eq!(
+                problem_row_colors(row, false, false).is_some(),
+                troubleshoot::problem_marker(row)
+            );
+            assert_eq!(problem_row_colors(row, true, false), None);
+            assert_eq!(problem_row_colors(row, false, true), None);
+        }
+        let mut row = rows[0].clone();
+        for status in 400..=599 {
+            row.status = Some(status);
+            assert_eq!(cell_text(&row, 1), status.to_string());
+            assert_eq!(
+                problem_row_colors(&row, false, false),
+                Some((RED, rgb(255, 238, 238)))
+            );
+        }
+        row.status = Some(400);
+        assert_eq!(troubleshoot::reason(&row), "400 Bad Request");
     }
 
     #[test]

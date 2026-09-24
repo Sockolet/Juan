@@ -339,17 +339,22 @@ try {
     $response = [JuanUiSmoke]::GetDlgItem($window, 115)
     Assert-That ($list -ne [IntPtr]::Zero) 'The native session list was not created.'
     if ($Troubleshooting) {
-        Wait-Until { (Get-RowCount $list) -eq 13 } 'Synthetic troubleshooting fixture did not load.'
+        Wait-Until { (Get-RowCount $list) -eq 10 } 'Default asset hiding did not leave ten synthetic rows.'
         $hide = [JuanUiSmoke]::GetDlgItem($window, 213)
         $restore = [JuanUiSmoke]::GetDlgItem($window, 214)
         $review = [JuanUiSmoke]::GetDlgItem($window, 215)
         $url = [JuanUiSmoke]::GetDlgItem($window, 117)
         $query = [JuanUiSmoke]::GetDlgItem($window, 217)
         $findInfo = [JuanUiSmoke]::GetDlgItem($window, 222)
-        Assert-That ([JuanUiSmoke]::Send($hide, 240, [IntPtr]::Zero, [IntPtr]::Zero) -eq [IntPtr]::Zero) 'Assets were hidden by default.'
+        Assert-That ($restore -eq [IntPtr]::Zero) 'Redundant Restore assets control still exists.'
+        Assert-That ([JuanUiSmoke]::Send($hide, 240, [IntPtr]::Zero, [IntPtr]::Zero) -eq [IntPtr]::new(1)) 'Hide assets was not checked by default.'
+        Assert-That ((Get-ControlText $hide) -eq 'Hide assets (3 hidden)') 'Default hidden count is incorrect.'
+        [void][JuanUiSmoke]::Send($hide, 245, [IntPtr]::Zero, [IntPtr]::Zero)
+        Wait-Until { (Get-RowCount $list) -eq 13 } 'Unchecking Hide assets did not restore all synthetic rows.'
+        Assert-That ((Get-ControlText $hide) -eq 'Hide assets (0 hidden)') 'Unchecked count is incorrect.'
         [void][JuanUiSmoke]::Send($hide, 245, [IntPtr]::Zero, [IntPtr]::Zero)
         Wait-Until { (Get-RowCount $list) -eq 10 } 'Asset toggle did not hide exactly CSS/JS/image successes.'
-        Assert-That ((Get-ControlText $restore).Contains('3 hidden')) 'Hidden count is incorrect.'
+        Assert-That ((Get-ControlText $hide).Contains('3 hidden')) 'Hidden count is incorrect.'
         Assert-That ((Get-ControlText $review).Contains('6 visible')) 'Review counts should include errors only, not missing bodies.'
         $scopeControl = [JuanUiSmoke]::GetDlgItem($window,109)
         [void][JuanUiSmoke]::Send($scopeControl,334,[IntPtr]::new(4),[IntPtr]::Zero)
@@ -364,13 +369,24 @@ try {
         Invoke-CommandId $window 215
         Wait-Until { (Get-ControlText $url).EndsWith('/server') } 'Review did not navigate next to 5xx.'
         Assert-That ((Get-RowCount $list) -eq 10) 'Review navigation changed visibility.'
+        Set-ControlText $search 'status:400'
+        Wait-Until { (Get-RowCount $list) -eq 1 } 'HTTP 400 asset failure was incorrectly hidden.'
+        Invoke-CommandId $window 215
+        Wait-Until { (Get-ControlText $url).EndsWith('/bad-request.css') } 'Review skipped HTTP 400.'
+        $mainTabs = [JuanUiSmoke]::GetDlgItem($window,111)
+        [void][JuanUiSmoke]::Send($window,40,$mainTabs,[IntPtr]::new(1))
+        [void][JuanUiSmoke]::PostMessageW($mainTabs,256,[IntPtr]::new(39),[IntPtr]::Zero)
+        Wait-Until { (Get-ControlText ([JuanUiSmoke]::GetDlgItem($window,116))).Contains('400 Bad Request') } 'HTTP 400 detail explanation is missing.'
+        [void][JuanUiSmoke]::PostMessageW($mainTabs,256,[IntPtr]::new(37),[IntPtr]::Zero)
+        Wait-Until { [JuanUiSmoke]::Send($mainTabs,4875,[IntPtr]::Zero,[IntPtr]::Zero) -eq [IntPtr]::Zero } 'Could not restore inspectors tab.'
         Set-ControlText $search 'status:403'
         Wait-Until { (Get-RowCount $list) -eq 1 } 'Filter did not combine with hide assets.'
         Assert-That ((Get-ControlText $review).Contains('1 visible')) 'Review did not disclose visible-scope count.'
         Invoke-CommandId $window 215
         Wait-Until { (Get-ControlText $url).EndsWith('/access') } 'Review failed within the current filter.'
-        Invoke-CommandId $window 214
-        Assert-That ((Get-RowCount $list) -eq 1) 'Restore assets silently cleared other filters.'
+        [void][JuanUiSmoke]::Send($hide, 245, [IntPtr]::Zero, [IntPtr]::Zero)
+        Assert-That ((Get-RowCount $list) -eq 1) 'Unchecking Hide assets silently cleared other filters.'
+        [void][JuanUiSmoke]::Send($hide, 245, [IntPtr]::Zero, [IntPtr]::Zero)
         Set-ControlText $search 'api.js'
         Wait-Until { (Get-RowCount $list) -eq 1 } 'JSON API ending in .js was hidden.'
         # Select the only row with the native keyboard path, preserving the owning UI thread's focus.
@@ -431,7 +447,7 @@ try {
         Set-ControlText $search ''
         Wait-Until { (Get-RowCount $list) -eq 13 } 'Restore did not preserve all original sessions.'
         Assert-That ((Get-ControlText ([JuanUiSmoke]::GetDlgItem($window,100))) -eq 'Start capture') 'Troubleshooting started capture.'
-        Write-Output 'Troubleshooting UI smoke passed: safe opt-in assets/restore, visible-scope review/navigation, Unicode message find/case/next/previous/wrap/Enter/Escape, filter switching, no capture.'
+        Write-Output 'Troubleshooting UI smoke passed: default assets checkbox/count, no Restore button, visible-scope review/navigation, Unicode message find/case/next/previous/wrap/Enter/Escape, filter switching, no capture.'
         return
     }
     if ($Har) {

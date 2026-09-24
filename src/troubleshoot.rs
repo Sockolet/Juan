@@ -1,6 +1,32 @@
 //! Deterministic view-only helpers; never infer causes or alter captured evidence.
 use crate::capture::{SessionKind, SessionSummary};
 
+pub const HIDE_ASSETS_DEFAULT: bool = true;
+
+pub fn problem_marker(row: &SessionSummary) -> bool {
+    Review::of(row).is_some()
+}
+
+pub fn reason(row: &SessionSummary) -> String {
+    let mut text = row.status.map_or_else(
+        || "Status not recorded".to_owned(),
+        |status| {
+            let phrase = http::StatusCode::from_u16(status)
+                .ok()
+                .and_then(|code| code.canonical_reason())
+                .unwrap_or("Status");
+            format!("{status} {phrase}")
+        },
+    );
+    if row.failed {
+        text.push_str("; recorded transport/source error");
+    }
+    if matches!(row.status, Some(401 | 407)) {
+        text.push_str("; authentication challenge may be expected");
+    }
+    text
+}
+
 pub fn static_asset(row: &SessionSummary) -> bool {
     if row.content_type_ambiguous
         || row.kind != SessionKind::Http
@@ -183,6 +209,26 @@ mod tests {
         let mut row = store.get(id.unwrap()).unwrap().summary();
         row.complete = true;
         row
+    }
+    #[test]
+    fn default_hiding_and_compact_markers_cover_all_http_errors() {
+        const { assert!(HIDE_ASSETS_DEFAULT) };
+        for status in 100..=599 {
+            let r = row(status, "text/css");
+            assert_eq!(problem_marker(&r), status >= 400);
+            if status >= 400 {
+                assert!(!static_asset(&r));
+            }
+        }
+        assert_eq!(reason(&row(400, "")), "400 Bad Request");
+        assert_eq!(reason(&row(503, "")), "503 Service Unavailable");
+        assert!(reason(&row(401, "")).contains("may be expected"));
+        let mut r = row(200, "text/css");
+        r.failed = true;
+        assert!(problem_marker(&r));
+        assert!(reason(&r).contains("recorded transport/source error"));
+        r.status = None;
+        assert!(problem_marker(&r));
     }
     #[test]
     fn assets_require_clear_successful_safe_method_and_mime() {
