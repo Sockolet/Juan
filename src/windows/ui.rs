@@ -72,6 +72,9 @@ const IMPORT_SAZ: u16 = 210;
 const EXPORT_SAZ: u16 = 211;
 const EXPORT_SAZ_SANITIZED: u16 = 212;
 const HIDE_ASSETS: u16 = 213;
+const RECENT_FIRST: u16 = 230;
+const RECENT_LAST: u16 = 234;
+const CLEAR_RECENT: u16 = 235;
 const REVIEW_FIRST: u16 = 215;
 const FIND: u16 = 216;
 const FIND_QUERY: u16 = 217;
@@ -224,6 +227,8 @@ struct App {
     import: RefCell<Option<mpsc::Receiver<ImportResult>>>,
     archive_name: RefCell<Option<String>>,
     initialization_error: RefCell<Option<String>>,
+    recent: RefCell<super::recent::RecentFiles>,
+    recent_warning: RefCell<Option<String>>,
 }
 
 impl App {
@@ -237,6 +242,16 @@ impl App {
         if demo {
             demo::populate(&store);
         }
+        let directory = system::data_directory()?;
+        let (recent, recent_warning) = match super::recent::RecentFiles::load(&directory) {
+            Ok(history) => (history, None),
+            Err(error) => (
+                super::recent::RecentFiles::empty(&directory),
+                Some(format!(
+                    "Recent-file history could not be loaded: {error:#}"
+                )),
+            ),
+        };
         Ok(Self {
             hide_assets: Cell::new(troubleshoot::HIDE_ASSETS_DEFAULT),
             review_cursor: Cell::new(None),
@@ -289,6 +304,8 @@ impl App {
             import: RefCell::new(None),
             archive_name: RefCell::new(None),
             initialization_error: RefCell::new(None),
+            recent: RefCell::new(recent),
+            recent_warning: RefCell::new(recent_warning),
         })
     }
 
@@ -709,6 +726,29 @@ impl App {
         }
     }
 
+    fn refresh_recent_menu(&self) -> Result<()> {
+        let history = make_recent_menu(&self.recent.borrow())?;
+        // SAFETY: The live window owns File and its old submenu. The new submenu
+        // transfers ownership only after SetMenuItemInfoW succeeds.
+        unsafe {
+            let file = GetSubMenu(GetMenu(self.hwnd.get()), 0);
+            let old = GetSubMenu(file, 1);
+            let info = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_SUBMENU,
+                hSubMenu: history,
+                ..Default::default()
+            };
+            if SetMenuItemInfoW(file, 1, 1, &info) == 0 {
+                DestroyMenu(history);
+                bail!("Update recent-file menu");
+            }
+            DestroyMenu(old);
+            DrawMenuBar(self.hwnd.get());
+        }
+        Ok(())
+    }
+
     fn report(&self, error: anyhow::Error) {
         let was_busy = self.busy.replace(true);
         let error = format!("{error:#}");
@@ -740,6 +780,29 @@ impl App {
             return Ok(());
         };
         match id {
+            RECENT_FIRST..=RECENT_LAST => {
+                let path = self
+                    .recent
+                    .borrow()
+                    .paths()
+                    .get((id - RECENT_FIRST) as usize)
+                    .cloned()
+                    .context("Recent-file entry is no longer available")?;
+                let path = super::recent::local_archive_path(&path)?;
+                self.begin_import(path, true)?;
+            }
+            CLEAR_RECENT => {
+                ensure!(
+                    self.import.borrow().is_none(),
+                    "Wait for the archive import before clearing recent files"
+                );
+                self.recent
+                    .borrow_mut()
+                    .clear()
+                    .context("Clear recent-file history")?;
+                self.refresh_recent_menu()?;
+                self.set_status("Recent-file history cleared. Archive files and retained sessions are unchanged.");
+            }
             HIDE_ASSETS => {
                 self.hide_assets.set(checked(c.hide_assets));
                 self.review_cursor.set(None);
@@ -1417,6 +1480,14 @@ impl App {
             self.store.notice(warning);
         }
         self.set_status(format!("Opened {count} archive sessions; {warnings} archive notes. See Timing and Diagnostics for fidelity details."));
+        let recorded = self.recent.borrow_mut().record_success(&path);
+        if let Err(error) = recorded {
+            self.report(error.context(
+                "Archive opened successfully, but recent-file history could not be saved",
+            ));
+        } else if let Err(error) = self.refresh_recent_menu() {
+            self.report(error);
+        }
         self.refresh(true);
         self.render_details(true);
         Ok(())
@@ -2419,7 +2490,7 @@ pub fn run(demo: bool, initial_archive: Option<PathBuf>) -> Result<()> {
     }
     let app = Box::new(App::new(demo)?);
     let class = wide("Juan.NativeDesktop");
-    let menu = make_menu()?;
+    let menu = make_menu(&app.recent.borrow())?;
     // SAFETY: The Box keeps App at a stable address until after WM_NCDESTROY and the message loop ends.
     unsafe {
         let instance = GetModuleHandleW(null());
@@ -2531,6 +2602,10 @@ pub fn run(demo: bool, initial_archive: Option<PathBuf>) -> Result<()> {
         }
         ShowWindow(hwnd, SW_SHOWNORMAL);
         UpdateWindow(hwnd);
+        let recent_warning = app.recent_warning.borrow_mut().take();
+        if let Some(warning) = recent_warning {
+            app.report(anyhow::anyhow!(warning));
+        }
         if let Some(path) = initial_archive
             && let Err(error) = app.begin_import(path, false)
         {
@@ -2970,7 +3045,7 @@ fn compare_rows(a: &SessionSummary, b: &SessionSummary, column: usize) -> Orderi
     }
 }
 
-fn make_menu() -> Result<HMENU> {
+fn make_menu(recent: &super::recent::RecentFiles) -> Result<HMENU> {
     // SAFETY: Ownership of the completed menu tree transfers to the main window.
     unsafe {
         let menu = CreateMenu();
@@ -3056,6 +3131,80 @@ fn make_menu() -> Result<HMENU> {
             DestroyMenu(menu);
             return Err(error);
         }
+        let file = GetSubMenu(menu, 0);
+        let history = match make_recent_menu(recent) {
+            Ok(history) => history,
+            Err(error) => {
+                DestroyMenu(menu);
+                return Err(error);
+            }
+        };
+        if InsertMenuW(
+            file,
+            1,
+            MF_BYPOSITION | MF_POPUP,
+            history as usize,
+            wide("&Recent files").as_ptr(),
+        ) == 0
+        {
+            DestroyMenu(history);
+            DestroyMenu(menu);
+            bail!("Attach recent-file menu");
+        }
+        Ok(menu)
+    }
+}
+
+fn make_recent_menu(recent: &super::recent::RecentFiles) -> Result<HMENU> {
+    // SAFETY: This function exclusively owns the menu until returning it; every
+    // error destroys it and successful callers attach it to the window's menu.
+    unsafe {
+        let menu = CreatePopupMenu();
+        ensure!(!menu.is_null(), "Create recent-file menu");
+        let result = (|| -> Result<()> {
+            if recent.paths().is_empty() {
+                ensure!(
+                    AppendMenuW(
+                        menu,
+                        MF_STRING | MF_GRAYED,
+                        0,
+                        wide("(No recent files)").as_ptr()
+                    ) != 0,
+                    "Create empty history label"
+                );
+            }
+            for (index, path) in recent.paths().iter().enumerate() {
+                let label = super::recent::menu_label(path, index);
+                ensure!(
+                    AppendMenuW(
+                        menu,
+                        MF_STRING,
+                        RECENT_FIRST as usize + index,
+                        wide(&label).as_ptr()
+                    ) != 0,
+                    "Create recent-file entry"
+                );
+            }
+            ensure!(
+                AppendMenuW(menu, MF_SEPARATOR, 0, null()) != 0,
+                "Create history separator"
+            );
+            // Always available, even after a corrupt history failed to load.
+            ensure!(
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    CLEAR_RECENT as usize,
+                    wide("&Clear history").as_ptr()
+                ) != 0,
+                "Create clear history command"
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            DestroyMenu(menu);
+            return Err(error);
+        }
         Ok(menu)
     }
 }
@@ -3063,6 +3212,25 @@ fn make_menu() -> Result<HMENU> {
 #[cfg(test)]
 mod capture_start_tests {
     use super::*;
+
+    #[test]
+    fn file_menu_contains_recent_archive_commands_and_clear_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capture.har");
+        std::fs::write(&path, "{}").unwrap();
+        let mut recent = super::super::recent::RecentFiles::empty(directory.path());
+        recent.record_success(&path).unwrap();
+        let menu = make_menu(&recent).unwrap();
+        // SAFETY: This test owns the unattached menu tree and destroys it once.
+        unsafe {
+            let file = GetSubMenu(menu, 0);
+            let history = GetSubMenu(file, 1);
+            assert_eq!(GetMenuItemCount(history), 3);
+            assert_eq!(GetMenuItemID(history, 0), RECENT_FIRST as u32);
+            assert_eq!(GetMenuItemID(history, 2), CLEAR_RECENT as u32);
+            DestroyMenu(menu);
+        }
+    }
 
     #[test]
     fn find_enter_preserves_native_button_actions() {

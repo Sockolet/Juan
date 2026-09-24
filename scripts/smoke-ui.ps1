@@ -4,7 +4,8 @@ param(
     [switch]$Saz,
     [switch]$Har,
     [switch]$HarBom,
-    [switch]$Troubleshooting
+    [switch]$Troubleshooting,
+    [switch]$RecentFiles
 )
 
 $ErrorActionPreference = 'Stop'
@@ -73,6 +74,14 @@ public static class JuanUiSmoke {
     public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
     [DllImport("user32.dll")]
     public static extern bool PrintWindow(IntPtr hwnd, IntPtr dc, uint flags);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetMenu(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetSubMenu(IntPtr menu, int position);
+    [DllImport("user32.dll")]
+    public static extern int GetMenuItemCount(IntPtr menu);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    public static extern int GetMenuStringW(IntPtr menu, uint item, StringBuilder text, int count, uint flags);
     public static IntPtr FindButton(IntPtr parent, string caption) {
         IntPtr found = IntPtr.Zero;
         EnumChildWindows(parent, (child, _) => {
@@ -353,7 +362,20 @@ if ($HarBom) { $Har = $true }
 if ($Har) { $fixture = Join-Path $PSScriptRoot '..\tests\fixtures\har\chrome.har' }
 if ($HarBom) { $fixture = Join-Path $PSScriptRoot '..\tests\fixtures\har\utf8-bom.har' }
 if ($Troubleshooting) { $fixture = Join-Path $PSScriptRoot '..\tests\fixtures\har\troubleshooting.har' }
-$start.Arguments = if ($Saz -or $Har -or $Troubleshooting) { '"' + (Resolve-Path -LiteralPath $fixture).Path + '"' } else { '--demo' }
+if ($RecentFiles) {
+    $recentFixtures = @()
+    foreach ($i in 0..6) {
+        $directory = Join-Path $profile "synthetic-$i"
+        [void][System.IO.Directory]::CreateDirectory($directory)
+        $destination = Join-Path $directory 'capture.har'
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\tests\fixtures\har\chrome.har') -Destination $destination
+        $recentFixtures += $destination
+    }
+    $sazFixture = Join-Path $profile 'capture.saz'
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\tests\fixtures\fiddler-reference.saz') -Destination $sazFixture
+    $fixture = $recentFixtures[0]
+}
+$start.Arguments = if ($Saz -or $Har -or $Troubleshooting -or $RecentFiles) { '"' + (Resolve-Path -LiteralPath $fixture).Path + '"' } else { '--demo' }
 $start.UseShellExecute = $false
 $start.WorkingDirectory = $profile
 $start.EnvironmentVariables['LOCALAPPDATA'] = $profile
@@ -371,6 +393,64 @@ try {
     $search = [JuanUiSmoke]::GetDlgItem($window, 108)
     $response = [JuanUiSmoke]::GetDlgItem($window, 115)
     Assert-That ($list -ne [IntPtr]::Zero) 'The native session list was not created.'
+    if ($RecentFiles) {
+        $historyFile = Join-Path $profile 'Juan\recent-files.json'
+        Wait-Until { (Test-Path -LiteralPath $historyFile) -and (Get-RowCount $list) -eq 1 } 'Startup HAR was not recorded after successful import.'
+        foreach ($path in @($recentFixtures[1..6]) + @($sazFixture)) {
+            [void][JuanUiSmoke]::PostMessageW($window,273,[IntPtr]::new(210),[IntPtr]::Zero)
+            Choose-File $window 'Open HAR or SAZ archive' $path
+            $confirm = Wait-Modal $window 'Replace retained sessions?'
+            Click-ModalButton $window $confirm 6
+            Wait-Until {
+                $saved = @(Get-Content -LiteralPath $historyFile -Raw | ConvertFrom-Json)
+                $saved.Count -gt 0 -and $saved[0].EndsWith($path, [StringComparison]::OrdinalIgnoreCase)
+            } 'Successful archive import was not persisted newest-first.'
+        }
+        $saved = @(Get-Content -LiteralPath $historyFile -Raw | ConvertFrom-Json)
+        Assert-That ($saved.Count -eq 5) 'Recent files did not enforce the five-entry cap.'
+        Assert-That ($saved[0].EndsWith('capture.saz')) 'SAZ was not recorded newest-first.'
+        $recentMenu = [JuanUiSmoke]::GetSubMenu([JuanUiSmoke]::GetSubMenu([JuanUiSmoke]::GetMenu($window),0),1)
+        Assert-That ([JuanUiSmoke]::GetMenuItemCount($recentMenu) -eq 7) 'Recent submenu should contain five paths, separator, and Clear history.'
+        $labels = @()
+        foreach ($i in 0..4) {
+            $label = [System.Text.StringBuilder]::new(32768)
+            [void][JuanUiSmoke]::GetMenuStringW($recentMenu,[uint32]$i,$label,$label.Capacity,1024)
+            $labels += $label.ToString()
+        }
+        Assert-That (($labels | Select-Object -Unique).Count -eq 5 -and $labels[1].Contains('synthetic-6')) 'Identical archive filenames were not disambiguated.'
+        # Close only the smoke-owned process, then reopen with the same isolated profile.
+        [void][JuanUiSmoke]::PostMessageW($window,16,[IntPtr]::Zero,[IntPtr]::Zero)
+        Assert-That ($process.WaitForExit(10000)) 'Synthetic instance did not close for persistence check.'
+        $process.Dispose()
+        $start.Arguments = ''
+        $process = [System.Diagnostics.Process]::Start($start)
+        Wait-Until { $process.Refresh(); $process.MainWindowHandle -ne [IntPtr]::Zero } 'Could not restart isolated recent-file smoke.'
+        $window = $process.MainWindowHandle
+        $list = [JuanUiSmoke]::GetDlgItem($window,110)
+        Invoke-CommandId $window 230
+        Wait-Until { (Get-RowCount $list) -eq 3 } 'Persisted SAZ did not reopen through the regular importer.'
+        Assert-That (@(Get-Content -LiteralPath $historyFile -Raw | ConvertFrom-Json).Count -eq 5) 'Reopening duplicated the recent path.'
+        Remove-Item -LiteralPath $sazFixture
+        [void][JuanUiSmoke]::PostMessageW($window,273,[IntPtr]::new(230),[IntPtr]::Zero)
+        $errorDialog = Wait-Modal $window 'Juan'
+        Click-ModalButton $window $errorDialog 1
+        Assert-That ((Get-RowCount $list) -eq 3) 'Missing recent file replaced retained sessions.'
+        $savedJson = Get-Content -LiteralPath $historyFile -Raw
+        Remove-Item -LiteralPath $historyFile
+        [void][System.IO.Directory]::CreateDirectory($historyFile)
+        [void][JuanUiSmoke]::PostMessageW($window,273,[IntPtr]::new(235),[IntPtr]::Zero)
+        $errorDialog = Wait-Modal $window 'Juan'
+        Click-ModalButton $window $errorDialog 1
+        Assert-That ((Get-RowCount $list) -eq 3) 'Failed history write changed retained sessions.'
+        Remove-Item -LiteralPath $historyFile
+        [System.IO.File]::WriteAllText($historyFile,$savedJson)
+        Invoke-CommandId $window 235
+        Wait-Until { @(Get-Content -LiteralPath $historyFile -Raw | ConvertFrom-Json).Count -eq 0 } 'Clear history was not persisted.'
+        Assert-That ((Get-RowCount $list) -eq 3) 'Clear history cleared captured sessions.'
+        Assert-That ((Get-ControlText ([JuanUiSmoke]::GetDlgItem($window,100))) -eq 'Start capture') 'Recent-file actions started capture.'
+        Write-Output 'Recent-files UI smoke passed: successful HAR/SAZ imports, five-entry cap, local disambiguated paths, restart/reopen, deduplication, missing-file preservation, visible write failure, persistent clear.'
+        return
+    }
     if ($Troubleshooting) {
         Wait-Until { (Get-RowCount $list) -eq 10 } 'Default asset hiding did not leave ten synthetic rows.'
         $hide = [JuanUiSmoke]::GetDlgItem($window, 213)
@@ -682,7 +762,7 @@ try {
     $ca = Join-Path $profile 'Juan\root-ca.dpapi'
     if (Test-Path -LiteralPath $ca) { Remove-Item -LiteralPath $ca }
     $dataDirectory = Join-Path $profile 'Juan'
-    if (Test-Path -LiteralPath $dataDirectory) { Remove-Item -LiteralPath $dataDirectory }
+    if (Test-Path -LiteralPath $dataDirectory) { Remove-Item -LiteralPath $dataDirectory -Recurse -Force }
     foreach ($name in 'exported.saz', 'exported.har', 'invalid.har') {
         $artifact = Join-Path $profile $name
         if (Test-Path -LiteralPath $artifact) { Remove-Item -LiteralPath $artifact }
@@ -693,7 +773,7 @@ try {
         $directory = Join-Path $profile $relative
         if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory }
     }
-    Remove-Item -LiteralPath $profile
+    Remove-Item -LiteralPath $profile -Recurse -Force
     Assert-That ((Get-ProxySnapshot) -ceq $before) 'Windows proxy settings changed during the smoke test.'
     Assert-That ((Get-RootTrustSnapshot) -ceq $trustBefore) 'Windows certificate trust changed during the smoke test.'
 }

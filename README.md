@@ -226,6 +226,24 @@ and arbitrary query expressions are not implemented.
 
 ### Troubleshooting views
 
+**File > Recent files** keeps the five most recently **successfully opened** HAR
+or SAZ archives, newest first, deduplicated case-insensitively by absolute path.
+Each menu entry includes its filename and full local path to disambiguate names.
+Reopening uses the same safe, transactional importer and replacement confirmation.
+Missing or invalid files report an error without replacing retained sessions.
+History contains paths only, never archive contents, and is stored per user in
+`%LOCALAPPDATA%\Juan\recent-files.json` using a flushed atomic replacement.
+Network/device paths and mapped network drives are not recorded. Read/write
+failures are displayed rather than silently ignored; a history-save failure does
+not undo a successful import. **Clear history** persists an empty list without
+deleting archive files or clearing sessions.
+
+Synthetic native checks: `scripts\smoke-ui.ps1 -RecentFiles` exercises history,
+restarting only its own isolated instance. `-Troubleshooting` saves native
+400/500/transport screenshots and requires actual red foreground glyph pixels,
+not merely a red icon or tinted background. These checks refuse to run while
+another Juan instance is open. Neither starts capture or changes proxy/trust.
+
 - **Hide assets** is checked by default, including after archive import. It hides only settled,
   successful GET/HEAD responses with recognized CSS, JavaScript or common image
   MIME types (including 304 cache responses). URL suffixes are never sufficient.
