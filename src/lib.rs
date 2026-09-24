@@ -7,6 +7,7 @@ pub mod har_import;
 pub mod inspect;
 pub mod proxy;
 pub mod saz;
+pub mod troubleshoot;
 
 #[cfg(windows)]
 pub mod windows;

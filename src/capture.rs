@@ -178,11 +178,41 @@ impl Session {
     }
 
     pub fn summary(&self) -> SessionSummary {
+        let mime = |value: &str| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        };
+        let declared = header(&self.response_headers, "content-type").map(mime);
+        let content_type_ambiguous = declared.as_ref().is_some_and(|first| {
+            self.response_headers
+                .iter()
+                .filter(|h| h.name.eq_ignore_ascii_case("content-type"))
+                .any(|h| mime(&h.value) != *first)
+                || self
+                    .archive
+                    .as_ref()
+                    .and_then(|a| a.har.as_ref())
+                    .is_some_and(|e| {
+                        !e.response.mime.is_empty() && mime(&e.response.mime) != *first
+                    })
+        });
         SessionSummary {
-            har: self.archive.as_ref().and_then(|a| a.har.as_ref()).map(|e| crate::har_import::Summary {
-                source: "HAR", time: e.time, request: e.request.clone(), response: e.response.clone(),
-                request_retained_bytes: self.request.data.len(), response_retained_bytes: self.response.data.len(),
-                request_available_bytes: self.request.total_bytes, response_available_bytes: self.response.total_bytes,
+            content_type_ambiguous,
+            har: self.archive.as_ref().and_then(|a| a.har.as_ref()).map(|e| {
+                crate::har_import::Summary {
+                    source: "HAR",
+                    time: e.time,
+                    request: e.request.clone(),
+                    response: e.response.clone(),
+                    request_retained_bytes: self.request.data.len(),
+                    response_retained_bytes: self.response.data.len(),
+                    request_available_bytes: self.request.total_bytes,
+                    response_available_bytes: self.response.total_bytes,
+                }
             }),
             id: self.id,
             method: self.method.clone(),
@@ -193,7 +223,12 @@ impl Session {
             status: self.status,
             kind: self.kind,
             content_type: header(&self.response_headers, "content-type")
-                .or_else(|| self.archive.as_ref().and_then(|a| a.har.as_ref()).map(|h| h.response.mime.as_str()))
+                .or_else(|| {
+                    self.archive
+                        .as_ref()
+                        .and_then(|a| a.har.as_ref())
+                        .map(|h| h.response.mime.as_str())
+                })
                 .unwrap_or("")
                 .split(';')
                 .next()
@@ -209,6 +244,7 @@ impl Session {
 
 #[derive(Clone, Debug)]
 pub struct SessionSummary {
+    pub content_type_ambiguous: bool,
     pub har: Option<crate::har_import::Summary>,
     pub id: u64,
     pub method: String,

@@ -3,7 +3,8 @@ param(
     [string]$Screenshot,
     [switch]$Saz,
     [switch]$Har,
-    [switch]$HarBom
+    [switch]$HarBom,
+    [switch]$Troubleshooting
 )
 
 $ErrorActionPreference = 'Stop'
@@ -318,7 +319,8 @@ $fixture = (Join-Path $PSScriptRoot '..\tests\fixtures\fiddler-reference.saz')
 if ($HarBom) { $Har = $true }
 if ($Har) { $fixture = Join-Path $PSScriptRoot '..\tests\fixtures\har\chrome.har' }
 if ($HarBom) { $fixture = Join-Path $PSScriptRoot '..\tests\fixtures\har\utf8-bom.har' }
-$start.Arguments = if ($Saz -or $Har) { '"' + (Resolve-Path -LiteralPath $fixture).Path + '"' } else { '--demo' }
+if ($Troubleshooting) { $fixture = Join-Path $PSScriptRoot '..\tests\fixtures\har\troubleshooting.har' }
+$start.Arguments = if ($Saz -or $Har -or $Troubleshooting) { '"' + (Resolve-Path -LiteralPath $fixture).Path + '"' } else { '--demo' }
 $start.UseShellExecute = $false
 $start.WorkingDirectory = $profile
 $start.EnvironmentVariables['LOCALAPPDATA'] = $profile
@@ -336,6 +338,90 @@ try {
     $search = [JuanUiSmoke]::GetDlgItem($window, 108)
     $response = [JuanUiSmoke]::GetDlgItem($window, 115)
     Assert-That ($list -ne [IntPtr]::Zero) 'The native session list was not created.'
+    if ($Troubleshooting) {
+        Wait-Until { (Get-RowCount $list) -eq 13 } 'Synthetic troubleshooting fixture did not load.'
+        $hide = [JuanUiSmoke]::GetDlgItem($window, 213)
+        $restore = [JuanUiSmoke]::GetDlgItem($window, 214)
+        $review = [JuanUiSmoke]::GetDlgItem($window, 215)
+        $url = [JuanUiSmoke]::GetDlgItem($window, 117)
+        $query = [JuanUiSmoke]::GetDlgItem($window, 217)
+        $findInfo = [JuanUiSmoke]::GetDlgItem($window, 222)
+        Assert-That ([JuanUiSmoke]::Send($hide, 240, [IntPtr]::Zero, [IntPtr]::Zero) -eq [IntPtr]::Zero) 'Assets were hidden by default.'
+        [void][JuanUiSmoke]::Send($hide, 245, [IntPtr]::Zero, [IntPtr]::Zero)
+        Wait-Until { (Get-RowCount $list) -eq 10 } 'Asset toggle did not hide exactly CSS/JS/image successes.'
+        Assert-That ((Get-ControlText $restore).Contains('3 hidden')) 'Hidden count is incorrect.'
+        Assert-That ((Get-ControlText $review).Contains('6 visible')) 'Review counts should include errors only, not missing bodies.'
+        $scopeControl = [JuanUiSmoke]::GetDlgItem($window,109)
+        [void][JuanUiSmoke]::Send($scopeControl,334,[IntPtr]::new(4),[IntPtr]::Zero)
+        [void][JuanUiSmoke]::Send($window,273,[IntPtr]::new(65645),$scopeControl)
+        Wait-Until { (Get-RowCount $list) -eq 6 } 'JSON scope did not combine with asset hiding.'
+        Assert-That ((Get-ControlText $review).Contains('4 visible')) 'Review count ignored JSON scope.'
+        [void][JuanUiSmoke]::Send($scopeControl,334,[IntPtr]::Zero,[IntPtr]::Zero)
+        [void][JuanUiSmoke]::Send($window,273,[IntPtr]::new(65645),$scopeControl)
+        Wait-Until { (Get-RowCount $list) -eq 10 } 'All scope failed to restore non-assets.'
+        Invoke-CommandId $window 215
+        Wait-Until { (Get-ControlText $url).EndsWith('/transport') } 'Review did not prioritize recorded transport evidence.'
+        Invoke-CommandId $window 215
+        Wait-Until { (Get-ControlText $url).EndsWith('/server') } 'Review did not navigate next to 5xx.'
+        Assert-That ((Get-RowCount $list) -eq 10) 'Review navigation changed visibility.'
+        Set-ControlText $search 'status:403'
+        Wait-Until { (Get-RowCount $list) -eq 1 } 'Filter did not combine with hide assets.'
+        Assert-That ((Get-ControlText $review).Contains('1 visible')) 'Review did not disclose visible-scope count.'
+        Invoke-CommandId $window 215
+        Wait-Until { (Get-ControlText $url).EndsWith('/access') } 'Review failed within the current filter.'
+        Invoke-CommandId $window 214
+        Assert-That ((Get-RowCount $list) -eq 1) 'Restore assets silently cleared other filters.'
+        Set-ControlText $search 'api.js'
+        Wait-Until { (Get-RowCount $list) -eq 1 } 'JSON API ending in .js was hidden.'
+        # Select the only row with the native keyboard path, preserving the owning UI thread's focus.
+        [void][JuanUiSmoke]::Send($window, 40, $list, [IntPtr]::new(1))
+        [void][JuanUiSmoke]::PostMessageW($list, 256, [IntPtr]::new(36), [IntPtr]::Zero)
+        Wait-Until { (Get-ControlText $response).Contains('Écho') } 'Could not select Unicode response.'
+        [void][JuanUiSmoke]::Send($window, 40, $response, [IntPtr]::new(1))
+        Invoke-CommandId $window 216
+        Set-ControlText $query 'écho'
+        Wait-Until { (Get-ControlText $findInfo).Contains('1 / 2') } 'Case-insensitive find did not match both Unicode occurrences.'
+        $display = Get-ControlText $response
+        $expected = $display.IndexOf('Écho', [StringComparison]::Ordinal)
+        $selection = [JuanUiSmoke]::Send($response, 176, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()
+        Assert-That (($selection -band 65535) -eq $expected) 'Native UTF-16 selection offset is incorrect after emoji.'
+        [void][JuanUiSmoke]::PostMessageW($query, 256, [IntPtr]::new(114), [IntPtr]::Zero)
+        Wait-Until { (Get-ControlText $findInfo).Contains('2 / 2') } 'F3 did not find the next occurrence.'
+        Invoke-CommandId $window 219
+        Wait-Until { (Get-ControlText $findInfo).Contains('wrapped') } 'Find did not report wrapping.'
+        Invoke-CommandId $window 220
+        Wait-Until { (Get-ControlText $findInfo).Contains('2 / 2') } 'Previous did not find the last occurrence.'
+        [void][JuanUiSmoke]::Send([JuanUiSmoke]::GetDlgItem($window, 218), 245, [IntPtr]::Zero, [IntPtr]::Zero)
+        Wait-Until { (Get-ControlText $findInfo).Contains('Not found') } 'Match-case setting was not applied.'
+        Set-ControlText $query 'Écho'
+        Wait-Until { (Get-ControlText $findInfo).Contains('1 / 1') } 'Case-sensitive Unicode find failed.'
+        [void][JuanUiSmoke]::PostMessageW($query, 256, [IntPtr]::new(13), [IntPtr]::Zero)
+        Wait-Until { (Get-ControlText $findInfo).Contains('wrapped') } 'Enter did not find next.'
+        $request = [JuanUiSmoke]::GetDlgItem($window,114)
+        [void][JuanUiSmoke]::Send($window,40,$request,[IntPtr]::new(1))
+        Wait-Until { (Get-ControlText $findInfo).StartsWith('Request preview selected') } 'Find did not follow request focus.'
+        Assert-That ([JuanUiSmoke]::Send($response,176,[IntPtr]::Zero,[IntPtr]::Zero) -eq [IntPtr]::Zero) 'Changing panes retained a stale response highlight.'
+        Set-ControlText $query 'HeaderNeedle'
+        Wait-Until { (Get-ControlText $findInfo).StartsWith('Request: 1 / 1') } 'Find did not search displayed request headers.'
+        $responseTabs = [JuanUiSmoke]::GetDlgItem($window,113)
+        [void][JuanUiSmoke]::Send($window,40,$responseTabs,[IntPtr]::new(1))
+        [void][JuanUiSmoke]::PostMessageW($responseTabs,256,[IntPtr]::new(37),[IntPtr]::Zero)
+        Wait-Until { [JuanUiSmoke]::Send($responseTabs,4875,[IntPtr]::Zero,[IntPtr]::Zero).ToInt32() -eq 1 } 'Could not switch response JSON to Text.'
+        Set-ControlText $query 'Écho'
+        Wait-Until { (Get-ControlText $findInfo).StartsWith('Response: 1 / 1') } 'Find did not follow the displayed response Text pane.'
+        [void][JuanUiSmoke]::PostMessageW($query, 256, [IntPtr]::new(27), [IntPtr]::Zero)
+        Wait-Until { -not [JuanUiSmoke]::IsWindowVisible($query) } 'Escape did not close message find.'
+        Invoke-CommandId $window 216
+        Set-ControlText $search 'status:599'
+        Wait-Until { (Get-RowCount $list) -eq 0 } 'Could not clear selection through filtering.'
+        Invoke-CommandId $window 219
+        Assert-That ((Get-ControlText $findInfo).Contains('Select a session')) 'Find did not handle a filtered-away selection safely.'
+        Set-ControlText $search ''
+        Wait-Until { (Get-RowCount $list) -eq 13 } 'Restore did not preserve all original sessions.'
+        Assert-That ((Get-ControlText ([JuanUiSmoke]::GetDlgItem($window,100))) -eq 'Start capture') 'Troubleshooting started capture.'
+        Write-Output 'Troubleshooting UI smoke passed: safe opt-in assets/restore, visible-scope review/navigation, Unicode message find/case/next/previous/wrap/Enter/Escape, filter switching, no capture.'
+        return
+    }
     if ($Har) {
         Wait-Until { (Get-RowCount $list) -eq 1 } 'The startup HAR did not load.'
         Assert-That ((Get-ControlText $response).Contains('Not valid, complete JSON')) 'The plain-text HAR body did not reach the JSON inspector without double decompression.'

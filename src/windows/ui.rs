@@ -14,7 +14,11 @@ use windows_sys::Win32::{
     Graphics::{Dwm::*, Gdi::*},
     System::{LibraryLoader::GetModuleHandleW, SystemServices::SS_CENTER},
     UI::{
-        Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::ShellExecuteW,
+        Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
+        Controls::*,
+        HiDpi::*,
+        Input::KeyboardAndMouse::*,
+        Shell::ShellExecuteW,
         WindowsAndMessaging::*,
     },
 };
@@ -33,6 +37,7 @@ use crate::{
     inspect::{self, Inspector},
     proxy::{self, ProxyConfig, ProxyHandle},
     saz,
+    troubleshoot::{self, Review},
 };
 
 const CAPTURE: u16 = 100;
@@ -67,6 +72,16 @@ const FOCUS_SEARCH: u16 = 209;
 const IMPORT_SAZ: u16 = 210;
 const EXPORT_SAZ: u16 = 211;
 const EXPORT_SAZ_SANITIZED: u16 = 212;
+const HIDE_ASSETS: u16 = 213;
+const RESTORE_ASSETS: u16 = 214;
+const REVIEW_FIRST: u16 = 215;
+const FIND: u16 = 216;
+const FIND_QUERY: u16 = 217;
+const FIND_CASE: u16 = 218;
+const FIND_NEXT: u16 = 219;
+const FIND_PREVIOUS: u16 = 220;
+const FIND_CLOSE: u16 = 221;
+const FIND_INFO: u16 = 222;
 const CAPTURE_WINDOWS: i32 = 1001;
 const CAPTURE_MANUAL: i32 = 1002;
 const HTTPS_TRUST_WINDOWS: i32 = 1101;
@@ -86,7 +101,7 @@ enum HttpsTrust {
 
 const COLUMNS: [(&str, i32); 9] = [
     ("#", 42),
-    ("Result", 58),
+    ("Result / review", 245),
     ("Method", 76),
     ("Protocol", 70),
     ("Host", 166),
@@ -97,6 +112,15 @@ const COLUMNS: [(&str, i32); 9] = [
 ];
 
 struct Controls {
+    hide_assets: HWND,
+    restore_assets: HWND,
+    review: HWND,
+    find_query: HWND,
+    find_case: HWND,
+    find_next: HWND,
+    find_previous: HWND,
+    find_close: HWND,
+    find_info: HWND,
     capture: HWND,
     stop: HWND,
     clear: HWND,
@@ -120,8 +144,17 @@ struct Controls {
 }
 
 impl Controls {
-    fn all(&self) -> [HWND; 20] {
+    fn all(&self) -> [HWND; 29] {
         [
+            self.hide_assets,
+            self.restore_assets,
+            self.review,
+            self.find_query,
+            self.find_case,
+            self.find_next,
+            self.find_previous,
+            self.find_close,
+            self.find_info,
             self.capture,
             self.stop,
             self.clear,
@@ -152,6 +185,11 @@ type ImportResult = std::result::Result<(PathBuf, saz::ImportedArchive), String>
 // Shared references plus narrowly scoped interior borrows allow Win32's synchronous reentrancy.
 // No mutable App reference is ever created from window user data.
 struct App {
+    hide_assets: Cell<bool>,
+    review_cursor: Cell<Option<u64>>,
+    find_open: Cell<bool>,
+    find_target: Cell<usize>,
+    find_cursor: Cell<Option<(usize, usize)>>,
     hwnd: Cell<HWND>,
     dpi: Cell<u32>,
     controls: OnceCell<Controls>,
@@ -204,6 +242,11 @@ impl App {
             demo::populate(&store);
         }
         Ok(Self {
+            hide_assets: Cell::new(false),
+            review_cursor: Cell::new(None),
+            find_open: Cell::new(false),
+            find_target: Cell::new(1),
+            find_cursor: Cell::new(None),
             hwnd: Cell::new(null_mut()),
             dpi: Cell::new(dpi),
             controls: OnceCell::new(),
@@ -289,6 +332,7 @@ impl App {
                     | WS_HSCROLL
                     | ES_MULTILINE as u32
                     | ES_READONLY as u32
+                    | ES_NOHIDESEL as u32
                     | ES_AUTOVSCROLL as u32
                     | ES_AUTOHSCROLL as u32,
                 0,
@@ -297,6 +341,29 @@ impl App {
         };
         let tabs = |id| child(parent, "SysTabControl32", "", WS_TABSTOP, 0, id);
         let controls = Controls {
+            hide_assets: checkbox("Hide assets", HIDE_ASSETS)?,
+            restore_assets: button("Restore assets (0 hidden)", RESTORE_ASSETS)?,
+            review: button("Review first (0 visible)", REVIEW_FIRST)?,
+            find_query: child(
+                parent,
+                "EDIT",
+                "",
+                WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32,
+                0,
+                FIND_QUERY,
+            )?,
+            find_case: checkbox("Match case", FIND_CASE)?,
+            find_next: button("Next", FIND_NEXT)?,
+            find_previous: button("Previous", FIND_PREVIOUS)?,
+            find_close: button("Close", FIND_CLOSE)?,
+            find_info: child(
+                parent,
+                "STATIC",
+                "Find in displayed preview only",
+                0,
+                0,
+                FIND_INFO,
+            )?,
             capture: button("Start capture", CAPTURE)?,
             stop: button("Stop", STOP)?,
             clear: button("Clear", CLEAR)?,
@@ -410,6 +477,13 @@ impl App {
                 wide("Search traffic...  host:api  status:4xx").as_ptr() as isize,
             );
             SendMessageW(controls.search, EM_SETLIMITTEXT, 2048, 0);
+            SendMessageW(controls.find_query, EM_SETLIMITTEXT, 256, 0);
+            SendMessageW(
+                controls.find_query,
+                EM_SETCUEBANNER,
+                1,
+                wide("Find in message (Ctrl+F)").as_ptr() as isize,
+            );
             SendMessageW(controls.port, EM_SETLIMITTEXT, 5, 0);
             for editor in [controls.request, controls.response, controls.detail] {
                 SendMessageW(editor, EM_SETLIMITTEXT, 4 * 1024 * 1024, 0);
@@ -510,7 +584,10 @@ impl App {
         position(c.autoscroll, width - s(126), s(84), s(114), s(32));
         position(c.search, s(16), s(151), split - s(174), s(29));
         position(c.scope, split - s(150), s(150), s(138), s(240));
-        position(c.list, s(16), s(194), split - s(27), height - s(237));
+        position(c.hide_assets, s(16), s(183), s(112), s(26));
+        position(c.restore_assets, s(133), s(183), split - s(145), s(26));
+        position(c.review, s(16), s(213), split - s(27), s(29));
+        position(c.list, s(16), s(248), split - s(27), height - s(291));
         position(
             c.main_tabs,
             split + s(14),
@@ -521,11 +598,30 @@ impl App {
         position(c.url, split + s(22), s(198), width - split - s(142), s(27));
         position(c.copy, width - s(112), s(195), s(90), s(29));
         let right = width - split - s(44);
-        let body_top = s(286);
+        let find_height = if self.find_open.get() { s(80) } else { 0 };
+        let body_top = s(286) + find_height;
         let available = (height - body_top - s(109)).max(s(100));
         let request_height = (available as f64 * 0.43) as i32;
         let response_label = body_top + request_height + s(15);
-        position(c.request_tabs, split + s(16), s(252), right + s(12), s(30));
+        position(
+            c.request_tabs,
+            split + s(16),
+            s(252) + find_height,
+            right + s(12),
+            s(30),
+        );
+        position(
+            c.find_query,
+            split + s(22),
+            s(230),
+            (right - s(220)).max(s(50)),
+            s(26),
+        );
+        position(c.find_previous, width - s(233), s(230), s(78), s(26));
+        position(c.find_next, width - s(151), s(230), s(58), s(26));
+        position(c.find_close, width - s(89), s(230), s(64), s(26));
+        position(c.find_case, split + s(22), s(260), s(110), s(22));
+        position(c.find_info, split + s(22), s(285), right, s(22));
         position(c.request, split + s(21), body_top, right, request_height);
         position(
             c.response_tabs,
@@ -543,6 +639,16 @@ impl App {
         );
         position(c.detail, split + s(21), s(238), right, height - s(282));
         let inspectors = self.main_tab.get() == 0;
+        for handle in [
+            c.find_query,
+            c.find_case,
+            c.find_next,
+            c.find_previous,
+            c.find_close,
+            c.find_info,
+        ] {
+            visible(handle, inspectors && self.find_open.get());
+        }
         for handle in [c.request_tabs, c.response_tabs, c.request, c.response] {
             visible(handle, inspectors);
         }
@@ -627,6 +733,48 @@ impl App {
             return Ok(());
         };
         match id {
+            HIDE_ASSETS | RESTORE_ASSETS => {
+                self.hide_assets
+                    .set(id == HIDE_ASSETS && checked(c.hide_assets));
+                set_checked(c.hide_assets, self.hide_assets.get());
+                self.review_cursor.set(None);
+                self.refresh(true);
+            }
+            REVIEW_FIRST => {
+                let order = troubleshoot::review_order(&self.rows.borrow());
+                if !order.is_empty() {
+                    let index = self
+                        .review_cursor
+                        .get()
+                        .and_then(|id| order.iter().position(|v| *v == id))
+                        .map_or(0, |i| (i + 1) % order.len());
+                    let id = order[index];
+                    self.review_cursor.set(Some(id));
+                    self.selected.set(Some(id));
+                    self.refresh(true);
+                    self.render_details(true);
+                    let row = self.rows.borrow().iter().position(|r| r.id == id);
+                    if let Some(row) = row {
+                        // SAFETY: Scroll the selected visible row without changing the sort or filters.
+                        unsafe {
+                            SendMessageW(c.list, LVM_ENSUREVISIBLE, row, 0);
+                        }
+                    }
+                    self.set_status(format!("Review {} of {} visible candidates; evidence, not a diagnosis. Order and filters unchanged.", index + 1, order.len()));
+                }
+            }
+            FIND => self.open_find(),
+            FIND_NEXT | FIND_PREVIOUS => {
+                if !self.find_open.get() || self.main_tab.get() != 0 {
+                    self.open_find();
+                }
+                self.find_step(id == FIND_PREVIOUS);
+            }
+            FIND_CASE => {
+                self.find_cursor.set(None);
+                self.find_step(false);
+            }
+            FIND_CLOSE => self.close_find(),
             CAPTURE => {
                 ensure!(
                     self.import.borrow().is_none(),
@@ -1113,7 +1261,10 @@ impl App {
         ensure!(!ids.is_empty(), "There are no visible sessions to export");
         let sessions = self.store.sessions(&ids);
         ensure!(
-            format != Format::Saz || sessions.iter().all(|s| s.archive.as_ref().is_none_or(|a| a.har.is_none())),
+            format != Format::Saz
+                || sessions
+                    .iter()
+                    .all(|s| s.archive.as_ref().is_none_or(|a| a.har.is_none())),
             "HAR-origin sessions cannot be exported to SAZ; HAR-to-SAZ conversion is deferred. Save HAR instead."
         );
         ensure!(
@@ -1242,9 +1393,12 @@ impl App {
                 .map(|session| session.id),
         );
         *self.filter.borrow_mut() = Filter::default();
+        self.hide_assets.set(false);
+        self.review_cursor.set(None);
         self.filter_error.borrow_mut().take();
         self.scope.set(0);
         if let Some(c) = self.controls.get() {
+            set_checked(c.hide_assets, false);
             // SAFETY: The selection change targets our live native combo box and retains no pointers.
             unsafe {
                 SendMessageW(c.scope, CB_SETCURSEL, 0, 0);
@@ -1352,6 +1506,7 @@ impl App {
             .filter(|row| row.is_error())
             .count();
         let old_count = self.rows.borrow().len();
+        let mut hidden = 0;
         let mut rows: Vec<_> = if self.filter_error.borrow().is_some() {
             Vec::new()
         } else {
@@ -1370,8 +1525,31 @@ impl App {
                             _ => true,
                         }
                 })
+                .filter(|row| {
+                    let hide = self.hide_assets.get() && troubleshoot::static_asset(row);
+                    if hide {
+                        hidden += 1;
+                    }
+                    !hide
+                })
                 .collect()
         };
+        set_text(
+            c.restore_assets,
+            &format!("Restore assets ({hidden} hidden in scope)"),
+        );
+        enable(c.restore_assets, self.hide_assets.get());
+        let order = troubleshoot::review_order(&rows);
+        let reason = order
+            .first()
+            .and_then(|id| rows.iter().find(|r| r.id == *id))
+            .and_then(Review::of)
+            .map_or("No flagged responses", Review::label);
+        set_text(
+            c.review,
+            &format!("Review first ({} visible): {reason}", order.len()),
+        );
+        enable(c.review, !order.is_empty());
         let (column, ascending) = self.sort.get();
         rows.sort_by(|a, b| {
             let order = compare_rows(a, b, column).then_with(|| a.id.cmp(&b.id));
@@ -1517,6 +1695,13 @@ impl App {
                 }
             }
             self.viewer_text.borrow_mut()[index] = value;
+            if self.find_open.get() && index == self.find_target.get() {
+                self.find_cursor.set(None);
+                set_text(
+                    c.find_info,
+                    "Preview changed; Next searches the current displayed text only.",
+                );
+            }
         }
         enable(c.copy, self.selected.get().is_some());
         // SAFETY: Chrome includes the selected request and response byte counters.
@@ -1526,6 +1711,7 @@ impl App {
     }
 
     fn filter_changed(&self) {
+        self.review_cursor.set(None);
         let Some(c) = self.controls.get() else { return };
         match Filter::parse(&text(c.search)) {
             Ok(filter) => {
@@ -1538,7 +1724,207 @@ impl App {
         }
         self.refresh(true);
     }
+    fn select_find_pane(&self, target: usize) {
+        let previous = self.find_target.replace(target);
+        if previous == target {
+            return;
+        }
+        self.find_cursor.set(None);
+        if self.find_open.get()
+            && let Some(c) = self.controls.get()
+        {
+            // SAFETY: A pane change invalidates the old inspector's search selection.
+            unsafe {
+                SendMessageW(
+                    if previous == 0 { c.request } else { c.response },
+                    EM_SETSEL,
+                    0,
+                    0,
+                );
+            }
+            set_text(
+                c.find_info,
+                if target == 0 {
+                    "Request preview selected; Next searches displayed text only."
+                } else {
+                    "Response preview selected; Next searches displayed text only."
+                },
+            );
+        }
+    }
 
+    fn open_find(&self) {
+        let Some(c) = self.controls.get() else { return };
+        // SAFETY: Read focus from this UI thread and focus our own query edit.
+        unsafe {
+            let focus = GetFocus();
+            if focus == c.request || focus == c.request_tabs {
+                self.select_find_pane(0);
+            }
+            if focus == c.response || focus == c.response_tabs {
+                self.select_find_pane(1);
+            }
+            self.main_tab.set(0);
+            SendMessageW(c.main_tabs, TCM_SETCURSEL, 0, 0);
+            self.find_open.set(true);
+            self.find_cursor.set(None);
+            self.layout();
+            self.render_details(false);
+            set_text(
+                c.find_info,
+                "Find in displayed preview only; Ctrl+L filters sessions.",
+            );
+            SetFocus(c.find_query);
+            SendMessageW(c.find_query, EM_SETSEL, 0, -1);
+        }
+    }
+
+    fn close_find(&self) {
+        let Some(c) = self.controls.get() else { return };
+        self.find_open.set(false);
+        self.find_cursor.set(None);
+        self.layout();
+        // SAFETY: Restore focus to the remembered live inspector control.
+        unsafe {
+            SetFocus(if self.find_target.get() == 0 {
+                c.request
+            } else {
+                c.response
+            });
+        }
+    }
+
+    fn find_step(&self, backwards: bool) {
+        let Some(c) = self.controls.get() else { return };
+        let target = self.find_target.get();
+        let tab = if target == 0 {
+            self.request_tab.get()
+        } else {
+            self.response_tab.get()
+        };
+        if self.selected.get().is_none() || tab == Inspector::Hex {
+            set_text(
+                c.find_info,
+                "Select a session and Headers, Text or JSON; search is preview-only.",
+            );
+            return;
+        }
+        let query = text(c.find_query);
+        if query.is_empty() {
+            self.find_cursor.set(None);
+            // SAFETY: Clear only the current inspector's stale search selection.
+            unsafe {
+                SendMessageW(
+                    if target == 0 { c.request } else { c.response },
+                    EM_SETSEL,
+                    0,
+                    0,
+                );
+            }
+            set_text(
+                c.find_info,
+                "Enter text; search is limited to this displayed preview.",
+            );
+            return;
+        }
+        let handle = if target == 0 { c.request } else { c.response };
+        let (value, capped) = {
+            let viewer = self.viewer_text.borrow();
+            let original = &viewer[target];
+            let mut end = original.len().min(inspect::PREVIEW_LIMIT);
+            while !original.is_char_boundary(end) {
+                end -= 1;
+            }
+            (original[..end].to_owned(), end < original.len())
+        };
+        let matches = troubleshoot::find_matches(&value, &query, checked(c.find_case));
+        let Some((index, wrapped)) =
+            troubleshoot::next_match(&matches.ranges, self.find_cursor.get(), backwards)
+        else {
+            self.find_cursor.set(None);
+            // SAFETY: Clear only our inspector's old match selection.
+            unsafe {
+                SendMessageW(handle, EM_SETSEL, 0, 0);
+            }
+            set_text(
+                c.find_info,
+                if capped {
+                    "Not found in first 2 MiB of displayed text; search limited."
+                } else {
+                    "Not found in displayed preview (not the whole capture)."
+                },
+            );
+            return;
+        };
+        let range = matches.ranges[index];
+        self.find_cursor.set(Some(range));
+        // SAFETY: Positions are mapped to UTF-16 offsets within this current edit text.
+        unsafe {
+            SendMessageW(handle, EM_SETSEL, range.0, range.1 as isize);
+            SendMessageW(handle, EM_SCROLLCARET, 0, 0);
+        }
+        set_text(
+            c.find_info,
+            &format!(
+                "{}: {} / {}{}{}; {}",
+                if target == 0 { "Request" } else { "Response" },
+                index + 1,
+                matches.ranges.len(),
+                if matches.limited {
+                    " (first 10000)"
+                } else {
+                    ""
+                },
+                if wrapped { " (wrapped)" } else { "" },
+                if capped {
+                    "first 2 MiB of displayed text only"
+                } else {
+                    "displayed preview only"
+                }
+            ),
+        );
+    }
+
+    fn find_key(&self, message: &MSG) -> bool {
+        if !self.find_open.get() || message.message != WM_KEYDOWN {
+            return false;
+        }
+        if message.wParam as u16 == VK_ESCAPE && self.main_tab.get() == 0 {
+            self.close_find();
+            return true;
+        }
+        let Some(c) = self.controls.get() else {
+            return false;
+        };
+        // SAFETY: Read current key/focus state; handle keys only in our find UI or message editors.
+        unsafe {
+            let focus = GetFocus();
+            if ![
+                c.find_query,
+                c.find_case,
+                c.find_next,
+                c.find_previous,
+                c.find_close,
+                c.request,
+                c.response,
+            ]
+            .contains(&focus)
+            {
+                return false;
+            }
+            match message.wParam as u16 {
+                VK_ESCAPE => {
+                    self.close_find();
+                    true
+                }
+                VK_RETURN => {
+                    self.find_step(GetKeyState(VK_SHIFT as i32) < 0);
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
     fn paint(&self) {
         let mut paint = PAINTSTRUCT::default();
         // SAFETY: BeginPaint/EndPaint bracket this UI-thread paint DC; helper routines restore selected objects.
@@ -1627,7 +2013,7 @@ impl App {
             );
             fill(
                 dc,
-                rect(s(15), s(193), split - s(10), height - s(42)),
+                rect(s(15), s(247), split - s(10), height - s(42)),
                 BORDER,
             );
             fill(
@@ -1641,10 +2027,15 @@ impl App {
                 WHITE,
             );
             if self.main_tab.get() == 0 {
-                let available = (height - s(286) - s(109)).max(s(100));
-                let response_y = s(286) + (available as f64 * 0.43) as i32 + s(15);
+                let find_height = if self.find_open.get() { s(80) } else { 0 };
+                let available = (height - s(286) - find_height - s(109)).max(s(100));
+                let response_y = s(286) + find_height + (available as f64 * 0.43) as i32 + s(15);
                 for (y, title, info) in [
-                    (s(229), "REQUEST", self.request_info.borrow().clone()),
+                    (
+                        s(229) + find_height,
+                        "REQUEST",
+                        self.request_info.borrow().clone(),
+                    ),
                     (response_y, "RESPONSE", self.response_info.borrow().clone()),
                 ] {
                     label(
@@ -1811,6 +2202,24 @@ impl App {
                     }
                     NM_CUSTOMDRAW => {
                         let draw = &mut *(lparam as *mut NMLVCUSTOMDRAW);
+                        let mut contrast = HIGHCONTRASTW {
+                            cbSize: size_of::<HIGHCONTRASTW>() as u32,
+                            ..Default::default()
+                        };
+                        if SystemParametersInfoW(
+                            SPI_GETHIGHCONTRAST,
+                            contrast.cbSize,
+                            (&mut contrast as *mut HIGHCONTRASTW).cast(),
+                            0,
+                        ) != 0
+                            && contrast.dwFlags & HCF_HIGHCONTRASTON != 0
+                            && draw.nmcd.dwDrawStage == CDDS_ITEMPREPAINT | CDDS_SUBITEM
+                            && draw.nmcd.uItemState & CDIS_SELECTED == 0
+                        {
+                            draw.clrText = GetSysColor(COLOR_WINDOWTEXT);
+                            draw.clrTextBk = GetSysColor(COLOR_WINDOW);
+                            return Some(CDRF_DODEFAULT as isize);
+                        }
                         match draw.nmcd.dwDrawStage {
                             CDDS_PREPAINT => return Some(CDRF_NOTIFYITEMDRAW as isize),
                             CDDS_ITEMPREPAINT => return Some(CDRF_NOTIFYSUBITEMDRAW as isize),
@@ -1818,13 +2227,20 @@ impl App {
                                 if let Some(row) = self.rows.borrow().get(draw.nmcd.dwItemSpec)
                                     && draw.nmcd.uItemState & CDIS_SELECTED == 0
                                 {
-                                    draw.clrTextBk = if draw.nmcd.dwItemSpec.is_multiple_of(2) {
+                                    let review = Review::of(row);
+                                    draw.clrTextBk = if review.is_some_and(Review::urgent) {
+                                        rgb(255, 238, 238)
+                                    } else if draw.nmcd.dwItemSpec.is_multiple_of(2) {
                                         WHITE
                                     } else {
                                         rgb(249, 251, 252)
                                     };
-                                    draw.clrText = if draw.iSubItem == 1 {
-                                        if row.is_error() {
+                                    draw.clrText = if review.is_some_and(Review::urgent) {
+                                        RED
+                                    } else if draw.iSubItem == 1 {
+                                        if review.is_some() {
+                                            AMBER
+                                        } else if row.is_error() {
                                             RED
                                         } else if row
                                             .status
@@ -1853,6 +2269,8 @@ impl App {
                         .set(SendMessageW(c.main_tabs, TCM_GETCURSEL, 0, 0) as usize);
                     self.layout();
                 } else if header.hwndFrom == c.request_tabs {
+                    self.select_find_pane(0);
+                    self.find_cursor.set(None);
                     self.request_tab.set(tab_kind(SendMessageW(
                         c.request_tabs,
                         TCM_GETCURSEL,
@@ -1860,6 +2278,8 @@ impl App {
                         0,
                     )));
                 } else if header.hwndFrom == c.response_tabs {
+                    self.select_find_pane(1);
+                    self.find_cursor.set(None);
                     self.response_tab.set(tab_kind(SendMessageW(
                         c.response_tabs,
                         TCM_GETCURSEL,
@@ -2000,6 +2420,21 @@ pub fn run(demo: bool, initial_archive: Option<PathBuf>) -> Result<()> {
         let accelerators = [
             ACCEL {
                 fVirt: FVIRTKEY | FCONTROL,
+                key: b'F' as u16,
+                cmd: FIND,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY,
+                key: VK_F3,
+                cmd: FIND_NEXT,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY | FSHIFT,
+                key: VK_F3,
+                cmd: FIND_PREVIOUS,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY | FCONTROL,
                 key: b'O' as u16,
                 cmd: IMPORT_SAZ,
             },
@@ -2061,7 +2496,8 @@ pub fn run(demo: bool, initial_archive: Option<PathBuf>) -> Result<()> {
                     std::io::Error::last_os_error()
                 ));
             }
-            if TranslateAcceleratorW(hwnd, accelerator, &message) == 0
+            if !app.find_key(&message)
+                && TranslateAcceleratorW(hwnd, accelerator, &message) == 0
                 && IsDialogMessageW(hwnd, &message) == 0
             {
                 TranslateMessage(&message);
@@ -2152,10 +2588,19 @@ unsafe extern "system" fn window_proc(
                 let code = ((wparam >> 16) & 0xffff) as u32;
                 if id == SEARCH && code == EN_CHANGE {
                     app.filter_changed();
+                } else if id == FIND_QUERY && code == EN_CHANGE {
+                    app.find_cursor.set(None);
+                    if app.find_open.get() {
+                        app.find_step(false);
+                    }
+                } else if (id == REQUEST_BODY || id == RESPONSE_BODY) && code == EN_SETFOCUS {
+                    let target = if id == REQUEST_BODY { 0 } else { 1 };
+                    app.select_find_pane(target);
                 } else if id == SCOPE && code == CBN_SELCHANGE {
                     if let Some(c) = app.controls.get() {
                         app.scope
                             .set(SendMessageW(c.scope, CB_GETCURSEL, 0, 0) as usize);
+                        app.review_cursor.set(None);
                         app.refresh(true);
                     }
                 } else if code == 0 || code == 1 {
@@ -2336,6 +2781,15 @@ fn empty_capture_message(active: bool, recording: bool, routed: bool, port: &str
 }
 
 fn cell_text(row: &SessionSummary, column: usize) -> String {
+    if column == 1
+        && let Some(review) = Review::of(row)
+    {
+        return format!(
+            "{} | {}",
+            row.status.map_or("-".into(), |s| s.to_string()),
+            review.label()
+        );
+    }
     match column {
         0 => row.id.to_string(),
         1 => row.status.map_or(
@@ -2413,6 +2867,17 @@ fn make_menu() -> Result<HMENU> {
                     ],
                 ),
                 (
+                    "&View",
+                    vec![
+                        (FIND, "Find in message...\tCtrl+F"),
+                        (FIND_NEXT, "Next message match\tF3"),
+                        (FIND_PREVIOUS, "Previous message match\tShift+F3"),
+                        (0, ""),
+                        (REVIEW_FIRST, "Review next visible candidate"),
+                        (RESTORE_ASSETS, "Restore hidden assets"),
+                    ],
+                ),
+                (
                     "&HTTPS",
                     vec![
                         (TRUST_CA, "Trust local CA..."),
@@ -2465,6 +2930,25 @@ fn make_menu() -> Result<HMENU> {
 #[cfg(test)]
 mod capture_start_tests {
     use super::*;
+
+    #[test]
+    fn problem_cells_explain_status_without_claiming_causes_or_missing_body_errors() {
+        let imported = crate::har_import::read(
+            include_bytes!("../../tests/fixtures/har/troubleshooting.har").as_slice(),
+            crate::capture::CaptureLimits::default(),
+        )
+        .unwrap();
+        let rows: Vec<_> = imported.sessions.iter().map(|s| s.summary()).collect();
+        assert!(cell_text(&rows[5], 1).contains("403: review access"));
+        assert!(cell_text(&rows[6], 1).contains("429: review throttling"));
+        assert!(cell_text(&rows[7], 1).contains("5xx: review server response"));
+        assert!(cell_text(&rows[8], 1).contains("Auth challenge: may be expected"));
+        assert!(cell_text(&rows[9], 1).contains("Recorded transport/source error"));
+        assert_eq!(cell_text(&rows[10], 1), "200");
+        assert!(Review::of(&rows[7]).unwrap().urgent());
+        assert!(Review::of(&rows[9]).unwrap().urgent());
+        assert!(!Review::of(&rows[8]).unwrap().urgent());
+    }
 
     #[test]
     fn routing_requires_an_explicit_choice_and_cancel_does_not_default_to_capture() {

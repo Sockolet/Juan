@@ -224,12 +224,54 @@ Prefix a term with `-` to negate it. Invalid field expressions are visibly rejec
 they do not silently fall back to unfiltered results. Quoted phrases, regexes,
 and arbitrary query expressions are not implemented.
 
+### Troubleshooting views
+
+- **Hide assets** is opt-in and resets off on archive import. It hides only settled,
+  successful GET/HEAD responses with recognized CSS, JavaScript or common image
+  MIME types (including 304 cache responses). URL suffixes are never sufficient.
+  Failures, incomplete requests, missing/ambiguous MIME types and POSTs remain
+  visible. Conflicting Content-Type headers or HAR MIME metadata prevent hiding.
+  **Restore assets** shows the hidden count within the current filter/scope and
+  restores those rows without clearing your other filters. Nothing is deleted.
+- **Result / review** includes text labels, not just color. Recorded transport/source
+  errors and 5xx rows receive red emphasis; 403, 429, authentication challenges
+  (401/407) and other 4xx have distinct review labels. A challenge can be expected.
+  Selected rows keep native selection colors; high-contrast rows use system colors.
+  Missing response bodies alone are not errors.
+- **Review first** counts only visible candidates. Clicking cycles deterministically
+  through recorded transport/source errors, 5xx, 429, 403, authentication challenges,
+  then other 4xx, with original session ID as tie-breaker. It navigates without
+  changing your filters or row order. These are bounded evidence labels, never
+  inferred causes, body excerpts or credential summaries. Clear filters explicitly
+  if you want to review the entire capture.
+- **Ctrl+F** finds literal text in the focused request/response Headers, Text or JSON
+  preview. The bar remembers the last message pane when focus is elsewhere.
+  Matching defaults to case-insensitive Unicode lowercase comparison; Match case
+  switches to exact matching. Enter/F3 advances, Shift+Enter/Shift+F3 goes backward,
+  and Escape closes the bar and returns focus to the message. The current match is
+  selected using native UTF-16 offsets; the bar reports counts, wrapping and misses.
+  Search is restricted to displayed text, capped at its first 2 MiB and first
+  10000 matches with explicit feedback. It does not search omitted/unretained
+  content, Hex bytes or other sessions. Changing a preview invalidates the previous
+  match safely; press Next to search the updated display.
+
+Defaults preserve capture chronology/current sorting and show all assets. These
+views work with live and imported sessions and do not change evidence or exports,
+except that exports continue to include only currently visible sessions. There is
+no automatic priority sorting, request correlation, AI diagnosis, regex search or
+global body scan. Native offline regression coverage is available through
+`.\scripts\smoke-ui.ps1 -Troubleshooting`.
+
 | Shortcut | Action |
 | --- | --- |
 | Ctrl+O | Open a HAR or SAZ archive while the proxy is stopped |
 | F12 | Start, pause, or resume capture |
 | Shift+F12 | Stop the proxy |
 | Ctrl+L | Focus the filter |
+| Ctrl+F | Find in the focused/last request or response preview |
+| F3 / Shift+F3 | Next / previous match in the message preview |
+| Enter / Shift+Enter in Find | Next / previous match |
+| Escape in Find | Close Find and return to the message |
 | Ctrl+S | Save visible sessions as sanitized HAR |
 | Ctrl+Shift+S | Save full HAR after a sensitivity warning |
 | Ctrl+Delete | Clear retained sessions |

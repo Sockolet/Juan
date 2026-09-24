@@ -117,6 +117,7 @@ mod tests {
 
     fn session() -> SessionSummary {
         SessionSummary {
+            content_type_ambiguous: false,
             har: None,
             id: 1,
             method: "POST".into(),
