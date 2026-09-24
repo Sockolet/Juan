@@ -236,11 +236,6 @@ fn malformed_essential_structure_or_any_entry_is_fatal_and_store_is_untouched() 
         },
         {
             let mut v = sample();
-            v["log"]["entries"][0]["time"] = json!(-0.5);
-            v
-        },
-        {
-            let mut v = sample();
             v["log"]["entries"].as_array_mut().unwrap().push(json!({}));
             v
         },
@@ -517,4 +512,163 @@ fn root_provenance_is_shared_and_parameter_previews_are_bounded() {
     let text = inspect::render(&imported.sessions[0], Side::Request, Inspector::Text);
     assert!(text.len() < 4096);
     assert!(text.contains("exceeds the preview limit"));
+}
+
+#[test]
+fn anomalous_optional_timings_are_unknown_with_safe_warnings_not_fatal() {
+    for invalid in [
+        json!(-0.865),
+        json!(-0.5),
+        json!(-2),
+        json!(1e30),
+        json!(18446744073709551616.0),
+        Value::Null,
+        json!(true),
+        json!("private-invalid-value"),
+        json!({"secret":"private-invalid-value"}),
+        json!([]),
+    ] {
+        for field in [
+            "time", "blocked", "dns", "ssl", "connect", "send", "wait", "receive",
+        ] {
+            let mut value = sample();
+            if field == "time" {
+                value["log"]["entries"][0]["time"] = invalid.clone();
+            } else {
+                value["log"]["entries"][0]["timings"][field] = invalid.clone();
+            }
+            let mut imported = parse(&value);
+            assert_eq!(imported.warnings.len(), 1);
+            assert!(!imported.warnings[0].contains("private-invalid-value"));
+            let session = imported.sessions.remove(0);
+            let evidence = session.archive.as_ref().unwrap().har.as_ref().unwrap();
+            if field == "time" {
+                assert_eq!(evidence.time, -1.0);
+                assert_eq!(session.elapsed_ms(), None);
+            } else {
+                assert_eq!(evidence.timings[field], -1.0);
+                assert_eq!(evidence.time, 12.875);
+            }
+            assert_eq!(session.response.data, b"already decoded!!");
+            let (_, again) = roundtrip(session, ExportMode::Full);
+            let evidence = again.archive.unwrap().har.unwrap();
+            assert_eq!(
+                if field == "time" {
+                    evidence.time
+                } else {
+                    evidence.timings[field]
+                },
+                -1.0
+            );
+        }
+    }
+}
+
+#[test]
+fn optional_timing_container_anomalies_and_duplicates_warn_without_fabrication() {
+    for invalid in [
+        Value::Null,
+        json!("private-value"),
+        json!(true),
+        json!(2),
+        json!([]),
+    ] {
+        let mut value = sample();
+        value["log"]["entries"][0]["timings"] = invalid;
+        let imported = parse(&value);
+        assert_eq!(imported.warnings.len(), 1);
+        let timing = &imported.sessions[0]
+            .archive
+            .as_ref()
+            .unwrap()
+            .har
+            .as_ref()
+            .unwrap()
+            .timings;
+        assert!(timing.values().all(|v| *v == -1.0));
+        assert_eq!(timing.len(), 3);
+    }
+    let mut value = sample();
+    value["log"]["entries"][0]["timings"] = json!({"blocked":1});
+    let text = value
+        .to_string()
+        .replace("\"blocked\":1", "\"blocked\":1,\"blocked\":2");
+    let imported = har_import::read(text.as_bytes(), CaptureLimits::default()).unwrap();
+    assert_eq!(imported.warnings.len(), 1);
+    assert_eq!(
+        imported.sessions[0]
+            .archive
+            .as_ref()
+            .unwrap()
+            .har
+            .as_ref()
+            .unwrap()
+            .timings["blocked"],
+        -1.0
+    );
+}
+
+#[test]
+fn valid_fractional_and_unknown_timings_stay_exact_and_unsafe_json_still_fails() {
+    for valid in [-1.0, 0.0, 0.125, 123456789.5] {
+        let mut value = sample();
+        value["log"]["entries"][0]["time"] = json!(valid);
+        value["log"]["entries"][0]["timings"]["blocked"] = json!(valid);
+        let imported = parse(&value);
+        assert!(imported.warnings.is_empty());
+        let evidence = imported.sessions[0]
+            .archive
+            .as_ref()
+            .unwrap()
+            .har
+            .as_ref()
+            .unwrap();
+        assert_eq!(evidence.time, valid);
+        assert_eq!(evidence.timings["blocked"], valid);
+    }
+    for invalid_number in ["1e400", "NaN", "Infinity"] {
+        let text = sample()
+            .to_string()
+            .replace("\"time\":12.875", &format!("\"time\":{invalid_number}"));
+        assert!(har_import::read(text.as_bytes(), CaptureLimits::default()).is_err());
+    }
+}
+
+#[test]
+fn browser_negative_phase_and_reported_sizes_do_not_discard_empty_response_evidence() {
+    let mut value = sample();
+    let first = value["log"]["entries"][0].clone();
+    value["log"]["entries"][0]["timings"]["blocked"] = json!(-0.865);
+    value["log"]["entries"][0]["response"]["bodySize"] = json!(-562);
+    value["log"]["entries"][0]["response"]["headersSize"] = json!(562);
+    value["log"]["entries"][0]["response"]["content"] = json!({"size":0,"text":""});
+    value["log"]["entries"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, first);
+    let imported = parse(&value);
+    assert_eq!(imported.sessions.len(), 2);
+    assert_eq!(imported.warnings.len(), 2);
+    assert!(
+        imported
+            .warnings
+            .iter()
+            .all(|warning| warning.starts_with("HAR entry 2:"))
+    );
+    let session = &imported.sessions[1];
+    let evidence = session.archive.as_ref().unwrap().har.as_ref().unwrap();
+    assert_eq!(evidence.timings["blocked"], -1.0);
+    assert_eq!(evidence.response.wire_size, -1);
+    assert_eq!(evidence.response_headers_size, 562);
+    assert_eq!(evidence.response.decoded_size, 0);
+    assert_eq!(evidence.response.availability, "present");
+    assert!(session.response.complete);
+    assert_eq!(evidence.time, 12.875);
+    for side in ["request", "response"] {
+        for field in ["bodySize", "headersSize"] {
+            let mut value = sample();
+            value["log"]["entries"][0][side][field] = json!(-20);
+            assert_eq!(parse(&value).warnings.len(), 1);
+        }
+    }
 }

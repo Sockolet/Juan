@@ -101,12 +101,12 @@ pub struct Parameter {
 #[serde(rename_all = "camelCase")]
 struct Entry {
     started_date_time: String,
-    #[serde(default = "unknown")]
-    time: f64,
+    #[serde(default)]
+    time: Timing,
     request: Request,
     response: Response,
     #[serde(default, deserialize_with = "timings")]
-    timings: BTreeMap<String, f64>,
+    timings: BTreeMap<String, Timing>,
     #[serde(default)]
     server_ip_address: String,
     #[serde(default)]
@@ -128,10 +128,58 @@ struct Juan {
     source_browser: Option<Agent>,
 }
 
-fn timings<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, f64>, D::Error> {
+#[derive(Clone, Copy)]
+struct Timing {
+    value: f64,
+    invalid: bool,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            value: -1.0,
+            invalid: false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Timing {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(d)?.as_f64();
+        // u64::MAX rounds up in f64, so use an exclusive upper bound before casting.
+        Ok(match value {
+            Some(value)
+                if value.is_finite()
+                    && (value == -1.0 || (value >= 0.0 && value < u64::MAX as f64)) =>
+            {
+                Self {
+                    value,
+                    invalid: false,
+                }
+            }
+            _ => Self {
+                value: -1.0,
+                invalid: true,
+            },
+        })
+    }
+}
+
+impl Timing {
+    fn normalized(self, id: u64, path: &str, warnings: &mut Vec<String>) -> f64 {
+        if self.invalid {
+            warnings.push(format!(
+                "HAR entry {id}: {path} is invalid or out of range; recorded as unknown (-1)"
+            ));
+        }
+        self.value
+    }
+}
+
+fn timings<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, Timing>, D::Error> {
     struct Timings;
     impl<'de> Visitor<'de> for Timings {
-        type Value = BTreeMap<String, f64>;
+        type Value = BTreeMap<String, Timing>;
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("HAR timings")
         }
@@ -143,8 +191,15 @@ fn timings<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, f6
                 ]
                 .contains(&key.as_str())
                 {
-                    if timings.insert(key, map.next_value()?).is_some() {
-                        return Err(M::Error::custom("Duplicate HAR timing"));
+                    let timing = map.next_value()?;
+                    if timings.insert(key.clone(), timing).is_some() {
+                        timings.insert(
+                            key,
+                            Timing {
+                                value: -1.0,
+                                invalid: true,
+                            },
+                        );
                     }
                 } else {
                     map.next_value::<IgnoredAny>()?;
@@ -152,11 +207,40 @@ fn timings<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, f6
             }
             Ok(timings)
         }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(invalid_timings())
+        }
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(invalid_timings())
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(invalid_timings())
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(invalid_timings())
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(invalid_timings())
+        }
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(invalid_timings())
+        }
+        fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(invalid_timings())
+        }
     }
-    d.deserialize_map(Timings)
+    d.deserialize_any(Timings)
 }
-fn unknown() -> f64 {
-    -1.0
+
+fn invalid_timings() -> BTreeMap<String, Timing> {
+    BTreeMap::from([(
+        String::new(),
+        Timing {
+            value: -1.0,
+            invalid: true,
+        },
+    )])
 }
 fn unknown_size() -> i64 {
     -1
@@ -521,27 +605,34 @@ fn convert(
     remaining: &mut usize,
     warnings: &mut Vec<String>,
 ) -> Result<Session> {
-    ensure!(
-        (entry.time == -1.0 || entry.time >= 0.0) && entry.time.is_finite(),
-        "Invalid total timing"
-    );
-    ensure!(
-        entry
-            .timings
-            .values()
-            .all(|t| t.is_finite() && (*t == -1.0 || *t >= 0.0)),
-        "Invalid HAR timing"
-    );
-    ensure!(
-        entry.request.body_size >= -1 && entry.response.body_size >= -1,
-        "Invalid body size"
-    );
-    ensure!(
-        entry.request.headers_size >= -1 && entry.response.headers_size >= -1,
-        "Invalid headers size"
-    );
+    let elapsed = entry.time.normalized(id, "time", warnings);
+    let mut timings: BTreeMap<String, f64> = entry
+        .timings
+        .into_iter()
+        .filter_map(|(name, timing)| {
+            if name.is_empty() {
+                timing.normalized(id, "timings", warnings);
+                return None;
+            }
+            let value = timing.normalized(id, &format!("timings.{name}"), warnings);
+            Some((name, value))
+        })
+        .collect();
+    for (size, path) in [
+        (&mut entry.request.body_size, "request.bodySize"),
+        (&mut entry.response.body_size, "response.bodySize"),
+        (&mut entry.request.headers_size, "request.headersSize"),
+        (&mut entry.response.headers_size, "response.headersSize"),
+    ] {
+        if *size < -1 {
+            *size = -1;
+            warnings.push(format!(
+                "HAR entry {id}: {path} is invalid; recorded as unknown (-1)"
+            ));
+        }
+    }
     for phase in ["send", "wait", "receive"] {
-        entry.timings.entry(phase.into()).or_insert(-1.0);
+        timings.entry(phase.into()).or_insert(-1.0);
     }
     ensure!(
         entry.response.content.is_object(),
@@ -605,8 +696,8 @@ fn convert(
         request: request_evidence,
         response: response_evidence,
         params,
-        timings: entry.timings,
-        time: entry.time,
+        timings,
+        time: elapsed,
         status_text: entry.response.status_text,
         redirect: entry.response.redirect_url,
         server_ip: entry.server_ip_address,
@@ -618,7 +709,7 @@ fn convert(
         id, method: entry.request.method, url: entry.request.url, host, path,
         protocol: entry.request.http_version, response_protocol: entry.response.http_version,
         client: String::new(), kind: SessionKind::Http, started_at: Some(started_at),
-        started: Instant::now(), duration_ms: (entry.time >= 0.0).then_some(entry.time as u64),
+        started: Instant::now(), duration_ms: (elapsed >= 0.0).then_some(elapsed as u64),
         headers_ms: None, status: (entry.response.status != 0).then_some(entry.response.status),
         request_headers: entry.request.headers, response_headers: entry.response.headers,
         request, response,         error: entry.error.or(entry.juan.error),

@@ -305,6 +305,14 @@ desktop snapshots also consume memory.
 - Original URLs and ordered duplicate headers are preserved in full exports.
   Protocol labels, status/reason, creator/browser, server/connection metadata,
   declared body/header sizes and fractional/unknown timing phases are retained.
+  Optional anomalous timing values (including browser-produced negative phases
+  other than `-1`, wrong types, or values outside the supported duration range)
+  become unknown (`-1`) with field-specific warnings, not zero or estimated time.
+  Valid phases and recorded total remain independent; totals are never recomputed.
+  Negative reported body/header sizes other than the unknown sentinel `-1` also
+  become unknown with warnings; they never replace the retained byte counts.
+  Invalid JSON, non-finite numeric literals and essential structure errors still
+  fail transactionally.
   Server IP is not presented as the client endpoint. Status zero is not HTTP 200.
 - Recognized Juan body omission, completion, partial, wire-base64 and error
   metadata is honored. Unknown vendor extensions, pages, cache details,
