@@ -1,6 +1,7 @@
 /target/
 /dist/
 *.har
+!/tests/fixtures/har/*.har
 *.saz
 !/tests/fixtures/fiddler-reference.saz
 !/tests/fixtures/legacy-v02.saz

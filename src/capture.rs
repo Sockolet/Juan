@@ -93,6 +93,7 @@ impl CapturedBody {
 
 #[derive(Clone, Debug)]
 pub struct ArchiveInfo {
+    pub har: Option<crate::har_import::Evidence>,
     pub original_id: u64,
     pub bit_flags: Option<u64>,
     pub flags: BTreeMap<String, String>,
@@ -178,6 +179,11 @@ impl Session {
 
     pub fn summary(&self) -> SessionSummary {
         SessionSummary {
+            har: self.archive.as_ref().and_then(|a| a.har.as_ref()).map(|e| crate::har_import::Summary {
+                source: "HAR", time: e.time, request: e.request.clone(), response: e.response.clone(),
+                request_retained_bytes: self.request.data.len(), response_retained_bytes: self.response.data.len(),
+                request_available_bytes: self.request.total_bytes, response_available_bytes: self.response.total_bytes,
+            }),
             id: self.id,
             method: self.method.clone(),
             url: self.url.clone(),
@@ -187,6 +193,7 @@ impl Session {
             status: self.status,
             kind: self.kind,
             content_type: header(&self.response_headers, "content-type")
+                .or_else(|| self.archive.as_ref().and_then(|a| a.har.as_ref()).map(|h| h.response.mime.as_str()))
                 .unwrap_or("")
                 .split(';')
                 .next()
@@ -202,6 +209,7 @@ impl Session {
 
 #[derive(Clone, Debug)]
 pub struct SessionSummary {
+    pub har: Option<crate::har_import::Summary>,
     pub id: u64,
     pub method: String,
     pub url: String,

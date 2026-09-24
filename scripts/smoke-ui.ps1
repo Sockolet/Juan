@@ -1,7 +1,8 @@
 param(
     [string]$Executable = (Join-Path $PSScriptRoot '..\target\release\juan.exe'),
     [string]$Screenshot,
-    [switch]$Saz
+    [switch]$Saz,
+    [switch]$Har
 )
 
 $ErrorActionPreference = 'Stop'
@@ -265,12 +266,14 @@ function Invoke-LocalProxyProbe([int]$Port) {
 
 $before = Get-ProxySnapshot
 $trustBefore = Get-RootTrustSnapshot
-$profile = Join-Path ([System.IO.Path]::GetTempPath()) ("juan-ui-" + [guid]::NewGuid().ToString('N'))
+$profile = Join-Path (Join-Path $PSScriptRoot '..\target') ("juan-ui-" + [guid]::NewGuid().ToString('N'))
+$profile = [System.IO.Path]::GetFullPath($profile)
 [void][System.IO.Directory]::CreateDirectory($profile)
 $start = [System.Diagnostics.ProcessStartInfo]::new()
 $start.FileName = $Executable
 $fixture = (Join-Path $PSScriptRoot '..\tests\fixtures\fiddler-reference.saz')
-$start.Arguments = if ($Saz) { '"' + (Resolve-Path -LiteralPath $fixture).Path + '"' } else { '--demo' }
+if ($Har) { $fixture = Join-Path $PSScriptRoot '..\tests\fixtures\har\chrome.har' }
+$start.Arguments = if ($Saz -or $Har) { '"' + (Resolve-Path -LiteralPath $fixture).Path + '"' } else { '--demo' }
 $start.UseShellExecute = $false
 $start.WorkingDirectory = $profile
 $start.EnvironmentVariables['LOCALAPPDATA'] = $profile
@@ -288,6 +291,50 @@ try {
     $search = [JuanUiSmoke]::GetDlgItem($window, 108)
     $response = [JuanUiSmoke]::GetDlgItem($window, 115)
     Assert-That ($list -ne [IntPtr]::Zero) 'The native session list was not created.'
+    if ($Har) {
+        Wait-Until { (Get-RowCount $list) -eq 1 } 'The startup HAR did not load.'
+        Assert-That ((Get-ControlText $response).Contains('Not valid, complete JSON')) 'The plain-text HAR body did not reach the JSON inspector without double decompression.'
+        Assert-That ((Get-ControlText $response).Contains('HAR SOURCE')) 'HAR provenance is missing.'
+        Assert-That ((Get-ControlText ([JuanUiSmoke]::GetDlgItem($window, 100))) -eq 'Start capture') 'HAR import started capture.'
+        foreach ($id in 104, 105) {
+            Assert-That ([JuanUiSmoke]::Send([JuanUiSmoke]::GetDlgItem($window, $id), 240, [IntPtr]::Zero, [IntPtr]::Zero) -eq [IntPtr]::Zero) 'HAR import enabled routing or decryption.'
+        }
+        Set-ControlText $search 'type:text'
+        Wait-Until { (Get-RowCount $list) -eq 1 } 'HAR MIME fallback filtering failed.'
+        Set-ControlText $search ''
+        $output = Join-Path $profile 'exported.har'
+        [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(103), [IntPtr]::Zero)
+        Choose-File $window 'Save visible sessions as HAR' $output
+        Wait-Until { Test-Path -LiteralPath $output } 'HAR export did not create a file.'
+        Wait-Until { [JuanUiSmoke]::IsWindowEnabled([JuanUiSmoke]::GetDlgItem($window, 103)) } 'HAR export did not finish.'
+        $cli = Join-Path (Split-Path -Parent $Executable) 'juan-cli.exe'
+        $rows = @(& $cli inspect $output | ForEach-Object { $_ | ConvertFrom-Json })
+        Assert-That ($LASTEXITCODE -eq 0 -and $rows.Count -eq 1) 'GUI-exported HAR failed read-back.'
+        Assert-That (-not ([System.IO.File]::ReadAllText($output).Contains('private-body'))) 'Sanitized HAR leaked a form value.'
+        [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(210), [IntPtr]::Zero)
+        $open = Wait-Modal $window 'Open HAR or SAZ archive'
+        [void][JuanUiSmoke]::PostMessageW($open, 273, [IntPtr]::new(2), [IntPtr]::Zero)
+        Wait-Until { [JuanUiSmoke]::GetLastActivePopup($window) -eq $window } 'Cancel open failed.'
+        Assert-That ((Get-RowCount $list) -eq 1) 'Cancelled open replaced existing HAR.'
+        [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(212), [IntPtr]::Zero)
+        $errorDialog = Wait-Modal $window 'Juan'
+        [void][JuanUiSmoke]::PostMessageW($errorDialog, 273, [IntPtr]::new(1), [IntPtr]::Zero)
+        Wait-Until { [JuanUiSmoke]::GetLastActivePopup($window) -eq $window } 'SAZ refusal did not dismiss.'
+        Assert-That ((Get-RowCount $list) -eq 1) 'SAZ refusal changed the capture.'
+        $invalid = Join-Path $profile 'invalid.har'
+        [System.IO.File]::WriteAllText($invalid, '{invalid')
+        [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(210), [IntPtr]::Zero)
+        Choose-File $window 'Open HAR or SAZ archive' $invalid
+        $confirm = Wait-Modal $window 'Replace retained sessions?'
+        [void][JuanUiSmoke]::PostMessageW($confirm, 273, [IntPtr]::new(6), [IntPtr]::Zero)
+        $errorDialog = Wait-Modal $window 'Juan'
+        [void][JuanUiSmoke]::PostMessageW($errorDialog, 273, [IntPtr]::new(1), [IntPtr]::Zero)
+        Wait-Until { [JuanUiSmoke]::GetLastActivePopup($window) -eq $window } 'Invalid HAR error did not dismiss.'
+        Assert-That ((Get-RowCount $list) -eq 1) 'Failed import replaced the previous capture.'
+        $process.Refresh()
+        Write-Output "HAR UI smoke passed: startup, decoded inspector, provenance, MIME filter, sanitized export/read-back, Open cancellation, SAZ refusal, failed import preservation. Working set: $([math]::Round($process.WorkingSet64 / 1MB, 1)) MiB."
+        return
+    }
     if ($Saz) {
         Wait-Until { (Get-RowCount $list) -eq 3 } 'The startup SAZ archive did not load its three synthetic sessions.'
         Assert-That ((Get-ControlText $response).Contains('Fiddler')) 'The imported JSON body did not appear in the inspector.'
@@ -308,7 +355,7 @@ try {
         [void][JuanUiSmoke]::Send([JuanUiSmoke]::GetDlgItem($warning, 7), 245, [IntPtr]::Zero, [IntPtr]::Zero)
         Wait-Until { [JuanUiSmoke]::GetLastActivePopup($window) -eq $window } 'Cancelling sensitive SAZ export did not dismiss the warning.'
         [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(210), [IntPtr]::Zero)
-        $open = Wait-Modal $window 'Open Fiddler session archive'
+        $open = Wait-Modal $window 'Open HAR or SAZ archive'
         [void][JuanUiSmoke]::PostMessageW($open, 273, [IntPtr]::new(2), [IntPtr]::Zero)
         Wait-Until { [JuanUiSmoke]::GetLastActivePopup($window) -eq $window } 'Cancelling Open SAZ did not dismiss the dialog.'
         Assert-That ((Get-RowCount $list) -eq 3) 'Cancelling Open SAZ replaced the previous sessions.'
@@ -430,7 +477,7 @@ try {
     if (Test-Path -LiteralPath $ca) { Remove-Item -LiteralPath $ca }
     $dataDirectory = Join-Path $profile 'Juan'
     if (Test-Path -LiteralPath $dataDirectory) { Remove-Item -LiteralPath $dataDirectory }
-    foreach ($name in 'exported.saz') {
+    foreach ($name in 'exported.saz', 'exported.har', 'invalid.har') {
         $artifact = Join-Path $profile $name
         if (Test-Path -LiteralPath $artifact) { Remove-Item -LiteralPath $artifact }
     }

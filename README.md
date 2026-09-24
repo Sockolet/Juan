@@ -44,7 +44,7 @@ choice. Version 0.1.0 started only the listener.
 | Inspectors | Request/response headers and trailers, UTF-8 text, formatted JSON, original body bytes in Hex, measured timings, diagnostic messages |
 | Compression | Bounded gzip, zlib-deflate, and Brotli decoding for inspection and export only |
 | Filtering | Text search, host, method, status/range, content type, scheme, errors, negation, and quick scope filters |
-| Archives | Native unencrypted SAZ import/export, SAZView-compatible index, and HAR 1.2 export; explicit partial-capture metadata and sensitive-export confirmation |
+| Archives | Native unencrypted SAZ import/export, SAZView-compatible index, HAR 1.2 import/export; explicit source/body provenance and sensitive-export confirmation |
 | Upgrades | HTTP/1.1 WebSocket handshake capture and transparent bidirectional relay; frames are not decoded |
 | Windows integration | Explicit current-user proxy routing, saved settings and crash recovery, explicit current-user CA trust/removal |
 | Headless | A separate CLI with JSON-line session summaries, timed capture, HAR export, and CA management |
@@ -226,7 +226,7 @@ and arbitrary query expressions are not implemented.
 
 | Shortcut | Action |
 | --- | --- |
-| Ctrl+O | Open a SAZ archive while the proxy is stopped |
+| Ctrl+O | Open a HAR or SAZ archive while the proxy is stopped |
 | F12 | Start, pause, or resume capture |
 | Shift+F12 | Stop the proxy |
 | Ctrl+L | Focus the filter |
@@ -259,9 +259,76 @@ HAR export includes retained sessions only, not already-evicted traffic.
 `cert trust`, `cert remove`, and `cert reset` require typed confirmation.
 Only one Juan desktop/capturing CLI instance runs per Windows session.
 
+## Browser HAR archives
+
+Stop the listener, then use **File > Open HAR or SAZ** or **Ctrl+O**, or pass a
+`.har` filename to the desktop. CLI inspection runs offline without starting a
+listener, recovering proxy settings, or changing certificate trust:
+
+```powershell
+.\juan.exe .\browser-capture.har
+.\juan-cli.exe inspect .\browser-capture.har
+.\juan-cli.exe inspect .\browser-capture.har --export .\sanitized.har
+.\juan-cli.exe inspect .\browser-capture.har --export .\full.har --full
+```
+
+HAR 1.2 browser exports from Chrome, Edge, Firefox and Juan are supported.
+Compatibility tests use synthetic browser-shaped fixtures and Juan-generated
+exports, not a certification of every browser release. Opening an archive
+replaces the current capture only after successful parsing and validation.
+Malformed essential structure, any invalid entry or exceeded input/session limits
+fail the whole import without replacing prior sessions. Invalid optional bodies
+produce warnings. No entries are silently skipped.
+
+**Limits:** input is capped at **128 MiB (134217728 bytes)**, enforced both on the
+file length and actual reads. Retention remains **1 MiB per body, 64 MiB aggregate
+body bytes, and 1000 sessions**. Body retention overflow keeps a marked prefix,
+not an invented complete body. Entries are parsed incrementally and unretained
+base64 tails are validated without retaining them. The input ceiling is **not a
+total RAM guarantee**: JSON strings, headers, structured parameters, parsing and
+desktop snapshots also consume memory.
+
+**Fidelity:**
+
+- HAR is browser-exported evidence, not reconstructed wire capture. Inspectors,
+  Timing and CLI `har` metadata distinguish UTF-8 text, decoded binary, Juan wire
+  fallback, missing, omitted, partial and locally truncated bodies. Explicit
+  empty text is a present empty body, not a missing one.
+- Browser content (including base64) is already decoded. A retained
+  `Content-Encoding: gzip` header does not trigger a second decompression.
+  Reported wire/body size and decoded size stay separate from retained bytes;
+  `-1` means unknown. CLI `bytes` is the available stored representation length
+  for HAR, **not** a network-transfer measurement.
+- Request `postData.params` stays structured evidence, visible in the body
+  inspector and full exports. Juan never invents multipart boundaries or
+  original body bytes from these parameters.
+- Original URLs and ordered duplicate headers are preserved in full exports.
+  Protocol labels, status/reason, creator/browser, server/connection metadata,
+  declared body/header sizes and fractional/unknown timing phases are retained.
+  Server IP is not presented as the client endpoint. Status zero is not HTTP 200.
+- Recognized Juan body omission, completion, partial, wire-base64 and error
+  metadata is honored. Unknown vendor extensions, pages, cache details,
+  structured cookie/query arrays, replay, merging and WebSocket frames are not
+  imported. URL query text and Cookie headers, when present, remain available.
+  No URL, file attachment or remote resource referenced inside the HAR is fetched.
+- Sanitized HAR export omits bodies, form values and source error details, and
+  uses existing credential-header/query redaction. It is **not anonymization**:
+  review URLs, paths and custom headers before sharing. Full export is sensitive.
+  Full/sanitized re-export preserves the distinction between unknown data and
+  retained evidence, without manufacturing timing phases.
+
+**HAR-to-SAZ conversion is deferred.** Both full and sanitized SAZ export reject
+HAR-origin sessions with a clear error. Save HAR instead. Live capture and
+existing SAZ behavior are unchanged. Opening HAR does not start capture or install
+trust; ordinary desktop startup retains its existing crash-recovery behavior.
+
+Validation uses `cargo test --locked --test har_archive --test har_cli` and
+`.\scripts\smoke-ui.ps1 -Har` (release build required). The smoke runner isolates
+its profile under `target` and checks proxy settings and root trust remain unchanged.
+
 ## Fiddler SAZ archives
 
-**Open:** stop the listener, then use **File > Open SAZ** or **Ctrl+O**. You can
+**Open:** stop the listener, then use **File > Open HAR or SAZ** or **Ctrl+O**. You can
 also pass a `.saz` filename to `juan.exe`. A successful import replaces retained
 sessions after confirmation; cancellation or an invalid archive leaves the
 previous sessions intact. Imports run in a background worker. Opening an archive
@@ -309,7 +376,7 @@ acquire the capture-instance lock or run proxy recovery.
 - `SessionTimers` attributes and `SessionFlags` are retained in full SAZ exports.
   Additional nonempty metadata sections are explicitly noted as unsupported.
   Missing or invalid start/duration information stays unavailable. **HAR export
-  requires a recorded start time and duration**; save SAZ instead when either is
+  from SAZ requires a recorded start time and duration**; save SAZ instead when either is
   unknown.
 - `_index.htm` contains safely escaped values and links understood by SAZView.
   Native import reads raw messages and XML only: it does not render or execute

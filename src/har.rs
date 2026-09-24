@@ -146,6 +146,9 @@ fn body_metadata(body: &CapturedBody) -> Value {
 }
 
 fn entry(session: &Session, mode: ExportMode) -> Result<Value> {
+    if let Some(evidence) = session.archive.as_ref().and_then(|a| a.har.as_ref()) {
+        return crate::har_import::export_entry(session, evidence, mode);
+    }
     let opaque = session.kind != SessionKind::Http;
     let url = if session.kind == SessionKind::Tunnel {
         format!("https://{}/", session.url)

@@ -10,12 +10,12 @@ fn main() {
             if std::path::Path::new(arg)
                 .extension()
                 .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("saz")) =>
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("saz") || extension.eq_ignore_ascii_case("har")) =>
         {
             juan::windows::ui::run(false, Some(std::path::PathBuf::from(arg)))
         }
         _ => Err(anyhow::anyhow!(
-            "Usage: juan [--demo | capture.saz]\nFor headless capture or archive inspection use juan-cli --help."
+            "Usage: juan [--demo | capture.saz | capture.har]\nFor headless capture or archive inspection use juan-cli --help."
         )),
     };
     if let Err(error) = result {

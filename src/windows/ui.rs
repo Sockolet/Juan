@@ -579,7 +579,7 @@ impl App {
         set_checked(c.https, self.decrypt.get());
         set_checked(c.system_proxy, self.routed.get());
         let title = if let Some(name) = self.archive_name.borrow().as_ref() {
-            format!("Juan - {name} (SAZ archive)")
+            format!("Juan - {name} (archive)")
         } else if self.demo.get() {
             "Juan - Demo data (no traffic intercepted)".to_owned()
         } else {
@@ -1113,6 +1113,10 @@ impl App {
         ensure!(!ids.is_empty(), "There are no visible sessions to export");
         let sessions = self.store.sessions(&ids);
         ensure!(
+            format != Format::Saz || sessions.iter().all(|s| s.archive.as_ref().is_none_or(|a| a.har.is_none())),
+            "HAR-origin sessions cannot be exported to SAZ; HAR-to-SAZ conversion is deferred. Save HAR instead."
+        );
+        ensure!(
             sessions.len() == ids.len(),
             "Some visible sessions were evicted before the export snapshot. Pause capture, refresh the view, and export again."
         );
@@ -1174,7 +1178,7 @@ impl App {
     fn begin_import(&self, path: PathBuf, confirm_replace: bool) -> Result<()> {
         ensure!(
             !self.active.get(),
-            "Stop the proxy before opening a SAZ archive"
+            "Stop the proxy before opening an archive"
         );
         ensure!(
             self.import.borrow().is_none() && self.export.borrow().is_none(),
@@ -1186,7 +1190,7 @@ impl App {
             && !confirm(
                 self.hwnd.get(),
                 "Replace retained sessions?",
-                "Opening a SAZ replaces the sessions currently in memory after the archive has been parsed successfully. Export any evidence you need first.\n\nNo proxy routing or certificate trust will be changed. Continue?",
+                "Opening an archive replaces the sessions currently in memory after the archive has been parsed successfully. Export any evidence you need first.\n\nNo proxy routing or certificate trust will be changed. Continue?",
             )
         {
             return Ok(());
@@ -1197,19 +1201,19 @@ impl App {
         };
         let (sender, receiver) = mpsc::channel();
         std::thread::Builder::new()
-            .name("juan-saz-import".into())
+            .name("juan-archive-import".into())
             .spawn(move || {
-                let result = saz::load(&path, limits)
+                let result = crate::archive::load(&path, limits)
                     .map(|archive| (path, archive))
                     .map_err(|error| format!("{error:#}"));
                 if sender.send(result).is_err() {
-                    eprintln!("SAZ import completed after its UI receiver closed.");
+                    eprintln!("Archive import completed after its UI receiver closed.");
                 }
             })
-            .context("Start SAZ import worker")?;
+            .context("Start archive import worker")?;
         *self.import.borrow_mut() = Some(receiver);
         self.set_status(
-            "Reading SAZ archive... Existing sessions are unchanged until import succeeds.",
+            "Reading archive... Existing sessions are unchanged until import succeeds.",
         );
         self.update_toolbar();
         Ok(())
@@ -1248,12 +1252,12 @@ impl App {
             set_text(c.search, "");
         }
         self.store.notice(format!(
-            "Opened {count} sessions from a SAZ archive without starting the proxy."
+            "Opened {count} sessions from an archive without starting the proxy."
         ));
         for warning in archive.warnings {
             self.store.notice(warning);
         }
-        self.set_status(format!("Opened {count} SAZ sessions; {warnings} archive notes. See Timing and Diagnostics for fidelity details."));
+        self.set_status(format!("Opened {count} archive sessions; {warnings} archive notes. See Timing and Diagnostics for fidelity details."));
         self.refresh(true);
         self.render_details(true);
         Ok(())
@@ -1284,7 +1288,7 @@ impl App {
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 self.import.borrow_mut().take();
                 self.report(anyhow::anyhow!(
-                    "The SAZ import worker stopped without returning a result"
+                    "The archive import worker stopped without returning a result"
                 ));
             }
             _ => {}
@@ -1597,7 +1601,7 @@ impl App {
                 dc,
                 rect(width - s(116), s(24), width - s(20), s(49)),
                 if !self.active.get() && self.archive_name.borrow().is_some() {
-                    "SAZ ARCHIVE"
+                    "ARCHIVE"
                 } else {
                     capture_badge(
                         self.demo.get(),
@@ -2388,7 +2392,7 @@ fn make_menu() -> Result<HMENU> {
                 (
                     "&File",
                     vec![
-                        (IMPORT_SAZ, "Open SAZ...\tCtrl+O"),
+                        (IMPORT_SAZ, "Open HAR or SAZ...\tCtrl+O"),
                         (EXPORT_SAZ, "Save SAZ (sensitive)..."),
                         (EXPORT_SAZ_SANITIZED, "Save sanitized SAZ..."),
                         (0, ""),

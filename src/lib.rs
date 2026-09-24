@@ -3,6 +3,7 @@ pub mod capture;
 pub mod certificate;
 pub mod filter;
 pub mod har;
+pub mod har_import;
 pub mod inspect;
 pub mod proxy;
 pub mod saz;

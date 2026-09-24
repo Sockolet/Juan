@@ -117,6 +117,7 @@ mod tests {
 
     fn session() -> SessionSummary {
         SessionSummary {
+            har: None,
             id: 1,
             method: "POST".into(),
             url: "https://api.example.test/v1/token".into(),
