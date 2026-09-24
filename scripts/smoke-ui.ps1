@@ -2,7 +2,8 @@ param(
     [string]$Executable = (Join-Path $PSScriptRoot '..\target\release\juan.exe'),
     [string]$Screenshot,
     [switch]$Saz,
-    [switch]$Har
+    [switch]$Har,
+    [switch]$HarBom
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,6 +42,24 @@ public static class JuanUiSmoke {
     public static extern int GetDlgCtrlID(IntPtr window);
     [DllImport("user32.dll")]
     public static extern bool IsWindowEnabled(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr window);
+    public static string Describe(IntPtr window) {
+        var result = new StringBuilder();
+        var text = new StringBuilder(2048);
+        var cls = new StringBuilder(128);
+        GetWindowTextW(window, text, text.Capacity);
+        GetClassNameW(window, cls, cls.Capacity);
+        result.AppendLine("Window " + window + " class=" + cls + " text=" + text);
+        EnumChildWindows(window, (child, _) => {
+            text.Clear(); cls.Clear();
+            GetWindowTextW(child, text, text.Capacity);
+            GetClassNameW(child, cls, cls.Capacity);
+            result.AppendLine("Child " + child + " id=" + GetDlgCtrlID(child) + " class=" + cls + " visible=" + IsWindowVisible(child) + " text=" + text);
+            return true;
+        }, IntPtr.Zero);
+        return result.ToString();
+    }
     [DllImport("user32.dll", EntryPoint="SendMessageW")]
     public static extern IntPtr Send(IntPtr hwnd, uint message, IntPtr wparam, IntPtr lparam);
     [DllImport("user32.dll", EntryPoint="SendMessageW", CharSet=CharSet.Unicode)]
@@ -185,6 +204,26 @@ function Wait-Modal([IntPtr]$Window, [string]$Title) {
     return [JuanUiSmoke]::GetLastActivePopup($Window)
 }
 
+function Click-ModalButton([IntPtr]$Window, [IntPtr]$Dialog, [int]$Id) {
+    $initial = [JuanUiSmoke]::GetDlgItem($Dialog, $Id)
+    Write-Output "Modal readiness: title='$(Get-ControlText $Dialog)' button=$Id exists=$($initial -ne [IntPtr]::Zero) visible=$([JuanUiSmoke]::IsWindowVisible($initial)) enabled=$([JuanUiSmoke]::IsWindowEnabled($initial))"
+    Write-Output ([JuanUiSmoke]::Describe($Dialog))
+    Wait-Until {
+        $button = [JuanUiSmoke]::GetDlgItem($Dialog, $Id)
+        if ($button -eq [IntPtr]::Zero -and $Id -eq 1) {
+            $button = [JuanUiSmoke]::FindButton($Dialog, 'OK')
+        }
+        $button -ne [IntPtr]::Zero -and [JuanUiSmoke]::IsWindowVisible($button) -and
+            [JuanUiSmoke]::IsWindowEnabled($button) -and -not [JuanUiSmoke]::IsWindowEnabled($Window)
+    } "Dialog button $Id did not become ready."
+    $button = [JuanUiSmoke]::GetDlgItem($Dialog, $Id)
+    if ($button -eq [IntPtr]::Zero -and $Id -eq 1) {
+        $button = [JuanUiSmoke]::FindButton($Dialog, 'OK')
+    }
+    Write-Output "Clicking actual dialog button id=$([JuanUiSmoke]::GetDlgCtrlID($button)) caption='$(Get-ControlText $button)'"
+    [void][JuanUiSmoke]::Send($button, 245, [IntPtr]::Zero, [IntPtr]::Zero)
+}
+
 function Choose-File([IntPtr]$Window, [string]$Title, [string]$Path) {
     $dialog = Wait-Modal $Window $Title
     Wait-Until {
@@ -195,8 +234,12 @@ function Choose-File([IntPtr]$Window, [string]$Title, [string]$Path) {
     $alternate = if ($preferred -eq 1001) { 1148 } else { 1001 }
     $filename = [JuanUiSmoke]::FindControlId($dialog, $preferred, 'Edit')
     if ($filename -eq [IntPtr]::Zero) { $filename = [JuanUiSmoke]::FindControlId($dialog, $alternate, 'Edit') }
-    Set-ControlText $filename $Path
-    Assert-That ((Get-ControlText $filename) -eq $Path) 'The file picker did not accept the explicit test output path.'
+    Wait-Until {
+        if (-not [JuanUiSmoke]::IsWindowVisible($filename) -or -not [JuanUiSmoke]::IsWindowEnabled($filename)) { return $false }
+        Set-ControlText $filename $Path
+        Start-Sleep -Milliseconds 100
+        (Get-ControlText $filename) -eq $Path
+    } 'The file picker did not accept the explicit test output path.'
     $button = [JuanUiSmoke]::FindControlId($dialog, 1, 'Button')
     Assert-That ($button -ne [IntPtr]::Zero) 'The file picker did not expose its confirmation button.'
     [void][JuanUiSmoke]::PostMessageW($button, 245, [IntPtr]::Zero, [IntPtr]::Zero)
@@ -272,7 +315,9 @@ $profile = [System.IO.Path]::GetFullPath($profile)
 $start = [System.Diagnostics.ProcessStartInfo]::new()
 $start.FileName = $Executable
 $fixture = (Join-Path $PSScriptRoot '..\tests\fixtures\fiddler-reference.saz')
+if ($HarBom) { $Har = $true }
 if ($Har) { $fixture = Join-Path $PSScriptRoot '..\tests\fixtures\har\chrome.har' }
+if ($HarBom) { $fixture = Join-Path $PSScriptRoot '..\tests\fixtures\har\utf8-bom.har' }
 $start.Arguments = if ($Saz -or $Har) { '"' + (Resolve-Path -LiteralPath $fixture).Path + '"' } else { '--demo' }
 $start.UseShellExecute = $false
 $start.WorkingDirectory = $profile
@@ -315,10 +360,13 @@ try {
         $open = Wait-Modal $window 'Open HAR or SAZ archive'
         [void][JuanUiSmoke]::PostMessageW($open, 273, [IntPtr]::new(2), [IntPtr]::Zero)
         Wait-Until { [JuanUiSmoke]::GetLastActivePopup($window) -eq $window } 'Cancel open failed.'
+        Wait-Until { [JuanUiSmoke]::IsWindowEnabled($window) } 'File picker did not re-enable its owner.'
+        # Owner reactivation precedes return from the native file picker and command busy guard.
+        Start-Sleep -Milliseconds 250
         Assert-That ((Get-RowCount $list) -eq 1) 'Cancelled open replaced existing HAR.'
         [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(212), [IntPtr]::Zero)
         $errorDialog = Wait-Modal $window 'Juan'
-        [void][JuanUiSmoke]::PostMessageW($errorDialog, 273, [IntPtr]::new(1), [IntPtr]::Zero)
+        Click-ModalButton $window $errorDialog 1
         Wait-Until { [JuanUiSmoke]::GetLastActivePopup($window) -eq $window } 'SAZ refusal did not dismiss.'
         Assert-That ((Get-RowCount $list) -eq 1) 'SAZ refusal changed the capture.'
         $invalid = Join-Path $profile 'invalid.har'
@@ -326,9 +374,9 @@ try {
         [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(210), [IntPtr]::Zero)
         Choose-File $window 'Open HAR or SAZ archive' $invalid
         $confirm = Wait-Modal $window 'Replace retained sessions?'
-        [void][JuanUiSmoke]::PostMessageW($confirm, 273, [IntPtr]::new(6), [IntPtr]::Zero)
+        Click-ModalButton $window $confirm 6
         $errorDialog = Wait-Modal $window 'Juan'
-        [void][JuanUiSmoke]::PostMessageW($errorDialog, 273, [IntPtr]::new(1), [IntPtr]::Zero)
+        Click-ModalButton $window $errorDialog 1
         Wait-Until { [JuanUiSmoke]::GetLastActivePopup($window) -eq $window } 'Invalid HAR error did not dismiss.'
         Assert-That ((Get-RowCount $list) -eq 1) 'Failed import replaced the previous capture.'
         $process.Refresh()
