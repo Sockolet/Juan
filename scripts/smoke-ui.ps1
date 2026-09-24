@@ -147,7 +147,7 @@ function Assert-That([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
 
-function Assert-RenderedErrorText([IntPtr]$List, [string]$Name, [string]$Directory) {
+function Assert-RenderedErrorText([IntPtr]$List, [string]$Name, [string]$Directory, [bool]$ExpectRed = $true) {
     $bounds = [JuanUiSmoke+RECT]::new()
     Assert-That ([JuanUiSmoke]::GetWindowRect($List, [ref]$bounds)) 'Cannot measure synthetic list.'
     $image = [System.Drawing.Bitmap]::new($bounds.Right - $bounds.Left, $bounds.Bottom - $bounds.Top)
@@ -158,9 +158,9 @@ function Assert-RenderedErrorText([IntPtr]$List, [string]$Name, [string]$Directo
         finally { $graphics.ReleaseHdc($dc) }
         $image.Save((Join-Path $Directory "$Name.png"), [System.Drawing.Imaging.ImageFormat]::Png)
         $left = 2
-        # Check real glyph pixels in ID, numeric status (excluding icon), method,
-        # protocol and host. Pale backgrounds and the error icon cannot pass.
-        for ($column = 0; $column -lt 5; $column++) {
+        # Check populated ID, status (excluding icon), method, host and URL cells.
+        # Protocol is optional in HAR. Pale backgrounds and icons cannot pass.
+        for ($column = 0; $column -lt 6; $column++) {
             $width = [JuanUiSmoke]::Send($List, 4125, [IntPtr]::new($column), [IntPtr]::Zero).ToInt32()
             $right = [Math]::Min($left + $width - 3, $image.Width - 3)
             if ($column -eq 1) { $right -= [Math]::Ceiling($width * 0.35) }
@@ -168,10 +168,21 @@ function Assert-RenderedErrorText([IntPtr]$List, [string]$Name, [string]$Directo
             for ($x = $left + 2; $x -lt $right; $x++) {
                 for ($y = 2; $y -lt $image.Height - 2; $y++) {
                     $pixel = $image.GetPixel($x, $y)
-                    if ($pixel.R -ge 140 -and $pixel.G -lt 110 -and $pixel.B -lt 110) { $red++ }
+                    # Match the actual foreground (178,48,65), not ClearType's
+                    # orange/red fringes around otherwise black native text.
+                    if ([Math]::Abs([int]$pixel.R - 178) -le 20 -and
+                        [Math]::Abs([int]$pixel.G - 48) -le 18 -and
+                        [Math]::Abs([int]$pixel.B - 65) -le 18) { $red++ }
                 }
             }
-            Assert-That ($red -ge 5) "$Name column $column has no red foreground glyphs; see native screenshot."
+            if ($column -ne 3) {
+                Write-Output "$Name column $column red foreground pixels: $red"
+                if ($ExpectRed) {
+                    Assert-That ($red -ge 3) "$Name column $column has no red foreground glyphs; see native screenshot."
+                } else {
+                    Assert-That ($red -eq 0) "$Name column $column overrode native selection text with red."
+                }
+            }
             $left += $width
         }
     } finally {
@@ -495,6 +506,7 @@ try {
         Wait-Until { (Get-RowCount $list) -eq 1 } 'HTTP 400 asset failure was incorrectly hidden.'
         Invoke-CommandId $window 215
         Wait-Until { (Get-ControlText $url).EndsWith('/bad-request.css') } 'Review skipped HTTP 400.'
+        Assert-RenderedErrorText $list 'http400-selected' $renderDirectory $false
         $mainTabs = [JuanUiSmoke]::GetDlgItem($window,111)
         [void][JuanUiSmoke]::Send($window,40,$mainTabs,[IntPtr]::new(1))
         [void][JuanUiSmoke]::PostMessageW($mainTabs,256,[IntPtr]::new(39),[IntPtr]::Zero)
@@ -530,7 +542,8 @@ try {
         $previous = [JuanUiSmoke]::GetDlgItem($window,220)
         [void][JuanUiSmoke]::Send($window,40,$previous,[IntPtr]::new(1))
         [void][JuanUiSmoke]::PostMessageW($previous,256,[IntPtr]::new(13),[IntPtr]::Zero)
-        Wait-Until { (Get-ControlText $findInfo).Contains('2 / 2 (wrapped)') } 'Enter on Previous did not search backward and wrap.'
+        try { Wait-Until { (Get-ControlText $findInfo).Contains('2 / 2 (wrapped)') } 'Enter on Previous did not search backward and wrap.' }
+        catch { throw "Enter on Previous failed. Actual: $(Get-ControlText $findInfo)" }
         $next = [JuanUiSmoke]::GetDlgItem($window,219)
         [void][JuanUiSmoke]::Send($window,40,$next,[IntPtr]::new(1))
         [void][JuanUiSmoke]::PostMessageW($next,256,[IntPtr]::new(13),[IntPtr]::Zero)
@@ -540,6 +553,7 @@ try {
         Wait-Until { (Get-ControlText $findInfo).Contains('Not found') } 'Match-case setting was not applied.'
         Set-ControlText $query 'Écho'
         Wait-Until { (Get-ControlText $findInfo).Contains('1 / 1') } 'Case-sensitive Unicode find failed.'
+        [void][JuanUiSmoke]::Send($window,40,$query,[IntPtr]::new(1))
         [void][JuanUiSmoke]::PostMessageW($query, 256, [IntPtr]::new(13), [IntPtr]::Zero)
         Wait-Until { (Get-ControlText $findInfo).Contains('wrapped') } 'Enter did not find next.'
         $request = [JuanUiSmoke]::GetDlgItem($window,114)

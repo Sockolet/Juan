@@ -365,9 +365,30 @@ impl App {
                 FIND_QUERY,
             )?,
             find_case: checkbox("Match case", FIND_CASE)?,
-            find_next: button("Next", FIND_NEXT)?,
-            find_previous: button("Previous", FIND_PREVIOUS)?,
-            find_close: button("Close", FIND_CLOSE)?,
+            find_next: child(
+                parent,
+                "BUTTON",
+                "Next",
+                WS_TABSTOP | BS_PUSHBUTTON as u32,
+                0,
+                FIND_NEXT,
+            )?,
+            find_previous: child(
+                parent,
+                "BUTTON",
+                "Previous",
+                WS_TABSTOP | BS_PUSHBUTTON as u32,
+                0,
+                FIND_PREVIOUS,
+            )?,
+            find_close: child(
+                parent,
+                "BUTTON",
+                "Close",
+                WS_TABSTOP | BS_PUSHBUTTON as u32,
+                0,
+                FIND_CLOSE,
+            )?,
             find_info: child(
                 parent,
                 "STATIC",
@@ -1962,9 +1983,19 @@ impl App {
         if self.controls.get().is_none() || message.wParam as u16 != VK_RETURN {
             return false;
         }
-        // SAFETY: Read this UI thread's focus/key state. Buttons retain native Enter handling.
+        // SAFETY: Read this UI thread's focus/key state and click only our focused
+        // native Find button. A modeless non-dialog window has no default-button ID.
         unsafe {
-            if !find_enter_search_control(GetDlgCtrlID(GetFocus())) {
+            let focus = GetFocus();
+            let id = GetDlgCtrlID(focus);
+            if [FIND_NEXT, FIND_PREVIOUS, FIND_CLOSE]
+                .map(i32::from)
+                .contains(&id)
+            {
+                SendMessageW(focus, BM_CLICK, 0, 0);
+                return true;
+            }
+            if !find_enter_search_control(id) {
                 return false;
             }
             self.find_step(GetKeyState(VK_SHIFT as i32) < 0);
@@ -2739,6 +2770,19 @@ unsafe extern "system" fn window_proc(
                 if let Some(result) = app.notify(lparam) {
                     return result;
                 }
+            }
+            WM_NEXTDLGCTL => {
+                // This is a modeless top-level window, not a dialog using DefDlgProc.
+                // Honor native dialog focus requests before routing Enter by focus.
+                let target = if lparam != 0 {
+                    wparam as HWND
+                } else {
+                    GetNextDlgTabItem(hwnd, GetFocus(), (wparam != 0) as i32)
+                };
+                if !target.is_null() && IsChild(hwnd, target) != 0 {
+                    SetFocus(target);
+                }
+                return 0;
             }
             WM_TIMER => {
                 app.tick();
