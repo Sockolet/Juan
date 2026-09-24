@@ -1893,36 +1893,16 @@ impl App {
             self.close_find();
             return true;
         }
-        let Some(c) = self.controls.get() else {
+        if self.controls.get().is_none() || message.wParam as u16 != VK_RETURN {
             return false;
-        };
-        // SAFETY: Read current key/focus state; handle keys only in our find UI or message editors.
+        }
+        // SAFETY: Read this UI thread's focus/key state. Buttons retain native Enter handling.
         unsafe {
-            let focus = GetFocus();
-            if ![
-                c.find_query,
-                c.find_case,
-                c.find_next,
-                c.find_previous,
-                c.find_close,
-                c.request,
-                c.response,
-            ]
-            .contains(&focus)
-            {
+            if !find_enter_search_control(GetDlgCtrlID(GetFocus())) {
                 return false;
             }
-            match message.wParam as u16 {
-                VK_ESCAPE => {
-                    self.close_find();
-                    true
-                }
-                VK_RETURN => {
-                    self.find_step(GetKeyState(VK_SHIFT as i32) < 0);
-                    true
-                }
-                _ => false,
-            }
+            self.find_step(GetKeyState(VK_SHIFT as i32) < 0);
+            true
         }
     }
     fn paint(&self) {
@@ -2780,6 +2760,12 @@ fn empty_capture_message(active: bool, recording: bool, routed: bool, port: &str
     }
 }
 
+fn find_enter_search_control(id: i32) -> bool {
+    [FIND_QUERY, REQUEST_BODY, RESPONSE_BODY]
+        .into_iter()
+        .any(|control| i32::from(control) == id)
+}
+
 fn cell_text(row: &SessionSummary, column: usize) -> String {
     if column == 1
         && let Some(review) = Review::of(row)
@@ -2930,6 +2916,17 @@ fn make_menu() -> Result<HMENU> {
 #[cfg(test)]
 mod capture_start_tests {
     use super::*;
+
+    #[test]
+    fn find_enter_preserves_native_button_actions() {
+        for id in [FIND_QUERY, REQUEST_BODY, RESPONSE_BODY] {
+            assert!(find_enter_search_control(i32::from(id)));
+        }
+        for id in [FIND_NEXT, FIND_PREVIOUS, FIND_CLOSE, FIND_CASE, SEARCH, 0] {
+            assert!(!find_enter_search_control(i32::from(id)));
+        }
+        assert!(!find_enter_search_control(-1));
+    }
 
     #[test]
     fn problem_cells_explain_status_without_claiming_causes_or_missing_body_errors() {

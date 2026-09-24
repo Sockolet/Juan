@@ -389,8 +389,15 @@ try {
         Wait-Until { (Get-ControlText $findInfo).Contains('2 / 2') } 'F3 did not find the next occurrence.'
         Invoke-CommandId $window 219
         Wait-Until { (Get-ControlText $findInfo).Contains('wrapped') } 'Find did not report wrapping.'
-        Invoke-CommandId $window 220
-        Wait-Until { (Get-ControlText $findInfo).Contains('2 / 2') } 'Previous did not find the last occurrence.'
+        $previous = [JuanUiSmoke]::GetDlgItem($window,220)
+        [void][JuanUiSmoke]::Send($window,40,$previous,[IntPtr]::new(1))
+        [void][JuanUiSmoke]::PostMessageW($previous,256,[IntPtr]::new(13),[IntPtr]::Zero)
+        Wait-Until { (Get-ControlText $findInfo).Contains('2 / 2 (wrapped)') } 'Enter on Previous did not search backward and wrap.'
+        $next = [JuanUiSmoke]::GetDlgItem($window,219)
+        [void][JuanUiSmoke]::Send($window,40,$next,[IntPtr]::new(1))
+        [void][JuanUiSmoke]::PostMessageW($next,256,[IntPtr]::new(13),[IntPtr]::Zero)
+        Wait-Until { (Get-ControlText $findInfo).Contains('1 / 2 (wrapped)') } 'Enter on Next did not search forward.'
+        [void][JuanUiSmoke]::Send($window,40,$query,[IntPtr]::new(1))
         [void][JuanUiSmoke]::Send([JuanUiSmoke]::GetDlgItem($window, 218), 245, [IntPtr]::Zero, [IntPtr]::Zero)
         Wait-Until { (Get-ControlText $findInfo).Contains('Not found') } 'Match-case setting was not applied.'
         Set-ControlText $query 'Écho'
@@ -411,6 +418,11 @@ try {
         Wait-Until { (Get-ControlText $findInfo).StartsWith('Response: 1 / 1') } 'Find did not follow the displayed response Text pane.'
         [void][JuanUiSmoke]::PostMessageW($query, 256, [IntPtr]::new(27), [IntPtr]::Zero)
         Wait-Until { -not [JuanUiSmoke]::IsWindowVisible($query) } 'Escape did not close message find.'
+        Invoke-CommandId $window 216
+        $closeFind = [JuanUiSmoke]::GetDlgItem($window,221)
+        [void][JuanUiSmoke]::Send($window,40,$closeFind,[IntPtr]::new(1))
+        [void][JuanUiSmoke]::PostMessageW($closeFind,256,[IntPtr]::new(13),[IntPtr]::Zero)
+        Wait-Until { -not [JuanUiSmoke]::IsWindowVisible($query) } 'Enter on Close searched instead of closing Find.'
         Invoke-CommandId $window 216
         Set-ControlText $search 'status:599'
         Wait-Until { (Get-RowCount $list) -eq 0 } 'Could not clear selection through filtering.'
