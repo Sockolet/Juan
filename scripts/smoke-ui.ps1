@@ -601,6 +601,8 @@ try {
         Set-ControlText $search ''
         $output = Join-Path $profile 'exported.har'
         [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(103), [IntPtr]::Zero)
+        $confirmation = Wait-Modal $window 'Export sanitized HAR?'
+        Click-ModalButton $window $confirmation 6
         Choose-File $window 'Save visible sessions as HAR' $output
         Wait-Until { Test-Path -LiteralPath $output } 'HAR export did not create a file.'
         Wait-Until { [JuanUiSmoke]::IsWindowEnabled([JuanUiSmoke]::GetDlgItem($window, 103)) } 'HAR export did not finish.'
@@ -644,6 +646,8 @@ try {
         }
         $output = Join-Path $profile 'exported.saz'
         [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(212), [IntPtr]::Zero)
+        $confirmation = Wait-Modal $window 'Export sanitized SAZ?'
+        Click-ModalButton $window $confirmation 6
         Choose-File $window 'Save visible sessions as SAZ' $output
         Wait-Until { Test-Path -LiteralPath $output } 'The native SAZ export did not create a file.'
         Wait-Until { [JuanUiSmoke]::IsWindowEnabled([JuanUiSmoke]::GetDlgItem($window, 103)) } 'The export completion was not acknowledged by the UI.'

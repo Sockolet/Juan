@@ -1,7 +1,63 @@
 //! Deterministic view-only helpers; never infer causes or alter captured evidence.
-use crate::capture::{SessionKind, SessionSummary};
+use crate::{
+    capture::{Session, SessionKind, SessionSummary},
+    filter::Filter,
+};
 
 pub const HIDE_ASSETS_DEFAULT: bool = true;
+
+pub fn matches_view(row: &SessionSummary, filter: &Filter, scope: usize) -> bool {
+    filter.matches(row)
+        && match scope {
+            1 => !row.is_https(),
+            2 => row.is_https(),
+            3 => row.is_error(),
+            4 => row.content_type.contains("json"),
+            5 => row.kind != SessionKind::Tunnel,
+            _ => true,
+        }
+}
+
+pub struct ExportSnapshot {
+    pub sessions: Vec<Session>,
+    pub asset_hidden: usize,
+    pub other_excluded: usize,
+}
+
+impl ExportSnapshot {
+    pub fn counts_message(&self) -> String {
+        format!(
+            "Export {} visible sessions from this snapshot.\nExcluded: {} hidden by Hide assets; {} excluded by other filters/scope.\nHidden/excluded sessions will NOT be exported.",
+            self.sessions.len(),
+            self.asset_hidden,
+            self.other_excluded
+        )
+    }
+}
+
+pub fn export_snapshot(
+    sessions: Vec<Session>,
+    filter: &Filter,
+    scope: usize,
+    hide_assets: bool,
+) -> ExportSnapshot {
+    let mut snapshot = ExportSnapshot {
+        sessions: Vec::new(),
+        asset_hidden: 0,
+        other_excluded: 0,
+    };
+    for session in sessions {
+        let row = session.summary();
+        if !matches_view(&row, filter, scope) {
+            snapshot.other_excluded += 1;
+        } else if hide_assets && static_asset(&row) {
+            snapshot.asset_hidden += 1;
+        } else {
+            snapshot.sessions.push(session);
+        }
+    }
+    snapshot
+}
 
 pub fn problem_marker(row: &SessionSummary) -> bool {
     Review::of(row).is_some()

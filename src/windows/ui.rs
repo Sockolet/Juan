@@ -1372,9 +1372,28 @@ impl App {
             self.export.borrow().is_none(),
             "An archive export is already running"
         );
-        let ids: Vec<_> = self.rows.borrow().iter().map(|row| row.id).collect();
-        ensure!(!ids.is_empty(), "There are no visible sessions to export");
-        let sessions = self.store.sessions(&ids);
+        ensure!(
+            self.filter_error.borrow().is_none(),
+            "Correct the invalid filter before exporting"
+        );
+        let snapshot = troubleshoot::export_snapshot(
+            self.store.all_sessions(),
+            &self.filter.borrow(),
+            self.scope.get(),
+            self.hide_assets.get(),
+        );
+        ensure!(
+            !snapshot.sessions.is_empty(),
+            "There are no visible sessions to export"
+        );
+        let counts = snapshot.counts_message();
+        let mut sessions = snapshot.sessions;
+        let (column, ascending) = self.sort.get();
+        sessions.sort_by(|a, b| {
+            let order =
+                compare_rows(&a.summary(), &b.summary(), column).then_with(|| a.id.cmp(&b.id));
+            if ascending { order } else { order.reverse() }
+        });
         ensure!(
             format != Format::Saz
                 || sessions
@@ -1382,21 +1401,27 @@ impl App {
                     .all(|s| s.archive.as_ref().is_none_or(|a| a.har.is_none())),
             "HAR-origin sessions cannot be exported to SAZ; HAR-to-SAZ conversion is deferred. Save HAR instead."
         );
-        ensure!(
-            sessions.len() == ids.len(),
-            "Some visible sessions were evicted before the export snapshot. Pause capture, refresh the view, and export again."
-        );
-        if mode == ExportMode::Full
-            && !confirm(
-                self.hwnd.get(),
-                &format!("Export sensitive full {}?", format.name()),
-                &format!(
-                    "A full {} includes retained request/response bodies, authorization headers, cookies, and URLs. It may contain passwords, personal information, and active credentials.\n\n\
-             Save only to an authorized location and review before sharing. Prefer the default sanitized export when bodies are not needed.\n\nContinue?",
-                    format.name()
-                ),
+        let warning = if mode == ExportMode::Full {
+            format!(
+                "A full {} includes retained request/response bodies, authorization headers, cookies, and URLs. It may contain passwords, personal information, and active credentials.\n\nSave only to an authorized location and review before sharing. Prefer sanitized export when bodies are not needed.",
+                format.name()
             )
-        {
+        } else {
+            "Sanitized export omits bodies and redacts common secrets. It is not anonymized; review URLs and custom headers before sharing.".to_owned()
+        };
+        if !confirm(
+            self.hwnd.get(),
+            &format!(
+                "Export {} {}?",
+                if mode == ExportMode::Full {
+                    "sensitive full"
+                } else {
+                    "sanitized"
+                },
+                format.name()
+            ),
+            &format!("{counts}\n\n{warning}\n\nContinue?"),
+        ) {
             return Ok(());
         }
         let now = time::OffsetDateTime::now_utc();
@@ -1508,7 +1533,6 @@ impl App {
                 .map(|session| session.id),
         );
         *self.filter.borrow_mut() = Filter::default();
-        self.hide_assets.set(troubleshoot::HIDE_ASSETS_DEFAULT);
         self.review_cursor.set(None);
         self.filter_error.borrow_mut().take();
         self.scope.set(0);
@@ -1641,17 +1665,7 @@ impl App {
             snapshot
                 .sessions
                 .into_iter()
-                .filter(|row| {
-                    filter.matches(row)
-                        && match self.scope.get() {
-                            1 => !row.is_https(),
-                            2 => row.is_https(),
-                            3 => row.is_error(),
-                            4 => row.content_type.contains("json"),
-                            5 => row.kind != SessionKind::Tunnel,
-                            _ => true,
-                        }
-                })
+                .filter(|row| troubleshoot::matches_view(row, &filter, self.scope.get()))
                 .filter(|row| {
                     let hide = self.hide_assets.get() && troubleshoot::static_asset(row);
                     if hide {
