@@ -20,6 +20,86 @@ fn parse(value: &Value) -> juan::saz::ImportedArchive {
     )
     .unwrap()
 }
+
+#[test]
+fn unsupported_entries_are_skipped_with_safe_original_ordinals() {
+    let mut value = sample();
+    let original = value["log"]["entries"][0].clone();
+    let mut entries = Vec::new();
+    for url in ["data:text/plain,SECRET", "blob:https://example.test/SECRET"] {
+        let mut entry = original.clone();
+        entry["request"]["url"] = json!(url);
+        entries.push(entry);
+    }
+    entries.push(original.clone());
+    for status in [100, 599, 600, 999, 99, 1000] {
+        let mut entry = original.clone();
+        entry["response"]["status"] = json!(status);
+        entries.push(entry);
+    }
+    value["log"]["entries"] = json!(entries);
+    let imported = parse(&value);
+    assert_eq!(imported.sessions.len(), 5);
+    assert_eq!(
+        imported.sessions[0].archive.as_ref().unwrap().original_id,
+        3
+    );
+    assert_eq!(imported.sessions.last().unwrap().status, Some(999));
+    assert_eq!(
+        imported.warnings,
+        [
+            "HAR entry 1: unsupported request.url; entry skipped",
+            "HAR entry 2: unsupported request.url; entry skipped",
+            "HAR entry 8: unsupported response.status; entry skipped",
+            "HAR entry 9: unsupported response.status; entry skipped",
+        ]
+    );
+    let (_, again) = roundtrip(imported.sessions[4].clone(), ExportMode::Full);
+    assert_eq!(again.status, Some(999));
+    let limited = CaptureLimits {
+        sessions: 8,
+        ..CaptureLimits::default()
+    };
+    assert!(har_import::read(serde_json::to_vec(&value).unwrap().as_slice(), limited).is_err());
+    value["log"]["entries"] = json!([entries[0], entries[1]]);
+    let error = har_import::read(
+        serde_json::to_vec(&value).unwrap().as_slice(),
+        CaptureLimits::default(),
+    )
+    .err()
+    .unwrap();
+    assert!(format!("{error:#}").contains("no importable sessions"));
+}
+
+#[test]
+fn missing_exported_bodies_do_not_imply_an_incomplete_exchange() {
+    let mut value = sample();
+    let entry = &mut value["log"]["entries"][0];
+    entry["request"]["method"] = json!("GET");
+    entry["request"].as_object_mut().unwrap().remove("postData");
+    entry["response"]["content"] = json!({"size": 32, "mimeType": "text/plain"});
+    let session = parse(&value).sessions.remove(0);
+    assert!(session.capture_complete());
+    assert!(!session.request.complete);
+    assert!(!session.response.complete);
+    assert_eq!(
+        session
+            .archive
+            .as_ref()
+            .unwrap()
+            .har
+            .as_ref()
+            .unwrap()
+            .response
+            .representation,
+        Representation::Unavailable
+    );
+    for mode in [ExportMode::Full, ExportMode::Sanitized] {
+        assert!(roundtrip(session.clone(), mode).1.capture_complete());
+    }
+    value["log"]["entries"][0]["response"]["content"]["_partial"] = json!(true);
+    assert!(!parse(&value).sessions[0].capture_complete());
+}
 fn roundtrip(session: juan::capture::Session, mode: ExportMode) -> (Value, juan::capture::Session) {
     let mut bytes = Vec::new();
     har::write_har(&mut bytes, &[session], mode).unwrap();
@@ -206,7 +286,7 @@ fn retention_counts_representation_not_compressed_wire_size_and_roundtrips_prefi
 }
 
 #[test]
-fn malformed_essential_structure_or_any_entry_is_fatal_and_store_is_untouched() {
+fn malformed_structure_or_zero_importable_entries_preserve_the_store() {
     let store = CaptureStore::default();
     store
         .replace_from_archive(parse(&sample()).sessions)
@@ -226,7 +306,7 @@ fn malformed_essential_structure_or_any_entry_is_fatal_and_store_is_untouched() 
         },
         {
             let mut v = sample();
-            v["log"]["entries"][0]["response"]["status"] = json!(999);
+            v["log"]["entries"][0]["response"]["status"] = json!(1000);
             v
         },
         {
@@ -239,11 +319,35 @@ fn malformed_essential_structure_or_any_entry_is_fatal_and_store_is_untouched() 
             v["log"]["entries"].as_array_mut().unwrap().push(json!({}));
             v
         },
+        {
+            let mut v = sample();
+            v["log"]["entries"][0]["response"]["content"] = json!("invalid structure");
+            v
+        },
     ] {
         let bytes = serde_json::to_vec(&invalid).unwrap();
         assert!(har_import::read(bytes.as_slice(), CaptureLimits::default()).is_err());
         assert_eq!(store.all_sessions()[0].id, before);
     }
+}
+
+#[test]
+fn empty_timing_key_is_an_ignored_extension_not_a_container_sentinel() {
+    let mut value = sample();
+    value["log"]["entries"][0]["timings"][""] = json!("PRIVATE_SYNTHETIC_VALUE");
+    let imported = parse(&value);
+    assert!(imported.warnings.is_empty());
+    assert!(
+        !imported.sessions[0]
+            .archive
+            .as_ref()
+            .unwrap()
+            .har
+            .as_ref()
+            .unwrap()
+            .timings
+            .contains_key("")
+    );
 }
 
 #[test]

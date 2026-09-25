@@ -106,7 +106,7 @@ struct Entry {
     request: Request,
     response: Response,
     #[serde(default, deserialize_with = "timings")]
-    timings: BTreeMap<String, Timing>,
+    timings: Timings,
     #[serde(default)]
     server_ip_address: String,
     #[serde(default)]
@@ -120,6 +120,8 @@ struct Entry {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Juan {
+    #[serde(default)]
+    capture_complete: Option<bool>,
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
@@ -176,10 +178,16 @@ impl Timing {
     }
 }
 
-fn timings<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, Timing>, D::Error> {
-    struct Timings;
-    impl<'de> Visitor<'de> for Timings {
-        type Value = BTreeMap<String, Timing>;
+#[derive(Default)]
+struct Timings {
+    values: BTreeMap<String, Timing>,
+    invalid_container: bool,
+}
+
+fn timings<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Timings, D::Error> {
+    struct TimingVisitor;
+    impl<'de> Visitor<'de> for TimingVisitor {
+        type Value = Timings;
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("HAR timings")
         }
@@ -205,7 +213,10 @@ fn timings<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, Ti
                     map.next_value::<IgnoredAny>()?;
                 }
             }
-            Ok(timings)
+            Ok(Timings {
+                values: timings,
+                invalid_container: false,
+            })
         }
         fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
             Ok(invalid_timings())
@@ -230,17 +241,14 @@ fn timings<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, Ti
             Ok(invalid_timings())
         }
     }
-    d.deserialize_any(Timings)
+    d.deserialize_any(TimingVisitor)
 }
 
-fn invalid_timings() -> BTreeMap<String, Timing> {
-    BTreeMap::from([(
-        String::new(),
-        Timing {
-            value: -1.0,
-            invalid: true,
-        },
-    )])
+fn invalid_timings() -> Timings {
+    Timings {
+        invalid_container: true,
+        ..Default::default()
+    }
 }
 fn unknown_size() -> i64 {
     -1
@@ -449,17 +457,25 @@ impl<'de> Visitor<'de> for EntriesSeed {
             warnings: Vec::new(),
         };
         let mut remaining = self.0.total_body_bytes;
+        let mut ordinal = 0;
         while let Some(entry) = seq.next_element::<Entry>()? {
-            if imported.sessions.len() >= self.0.sessions {
+            ordinal += 1;
+            if ordinal > self.0.sessions {
                 return Err(S::Error::custom("HAR exceeds session retention limit"));
             }
-            let id = imported.sessions.len() as u64 + 1;
+            let id = ordinal as u64;
+            if let Some(field) = unsupported_entry_field(&entry) {
+                imported.warnings.push(format!(
+                    "HAR entry {id}: unsupported {field}; entry skipped"
+                ));
+                continue;
+            }
             let session = convert(entry, id, self.0, &mut remaining, &mut imported.warnings)
                 .map_err(|e| S::Error::custom(format!("HAR entry {id}: {e:#}")))?;
             imported.sessions.push(session);
         }
         if imported.sessions.is_empty() {
-            return Err(S::Error::custom("HAR contains no sessions"));
+            return Err(S::Error::custom("HAR contains no importable sessions"));
         }
         Ok(imported)
     }
@@ -598,6 +614,24 @@ fn decode_prefix(text: &str, keep: usize) -> std::io::Result<(Vec<u8>, u64)> {
     Ok((bytes, count))
 }
 
+fn unsupported_entry_field(entry: &Entry) -> Option<&'static str> {
+    if http::Method::from_bytes(entry.request.method.as_bytes()).is_err() {
+        return Some("request.method");
+    }
+    match entry.request.url.parse::<http::Uri>() {
+        Ok(uri)
+            if matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some() => {}
+        _ => return Some("request.url"),
+    }
+    if entry.response.status != 0 && !(100..=999).contains(&entry.response.status) {
+        return Some("response.status");
+    }
+    if OffsetDateTime::parse(&entry.started_date_time, &Rfc3339).is_err() {
+        return Some("startedDateTime");
+    }
+    None
+}
+
 fn convert(
     mut entry: Entry,
     id: u64,
@@ -606,16 +640,18 @@ fn convert(
     warnings: &mut Vec<String>,
 ) -> Result<Session> {
     let elapsed = entry.time.normalized(id, "time", warnings);
+    if entry.timings.invalid_container {
+        warnings.push(format!(
+            "HAR entry {id}: timings is invalid; recorded as unknown (-1)"
+        ));
+    }
     let mut timings: BTreeMap<String, f64> = entry
         .timings
+        .values
         .into_iter()
-        .filter_map(|(name, timing)| {
-            if name.is_empty() {
-                timing.normalized(id, "timings", warnings);
-                return None;
-            }
+        .map(|(name, timing)| {
             let value = timing.normalized(id, &format!("timings.{name}"), warnings);
-            Some((name, value))
+            (name, value)
         })
         .collect();
     for (size, path) in [
@@ -647,7 +683,7 @@ fn convert(
         "Expected absolute request URL"
     );
     ensure!(
-        entry.response.status == 0 || (100..=599).contains(&entry.response.status),
+        entry.response.status == 0 || (100..=999).contains(&entry.response.status),
         "Invalid response status"
     );
     let host = uri.host().unwrap_or("").to_owned();
@@ -689,7 +725,18 @@ fn convert(
         },
         None => Vec::new(),
     };
-    let complete = request.complete && response.complete;
+    // Missing exported bytes are availability, not evidence of an unfinished exchange.
+    // Explicit source partial flags still make the archive incomplete.
+    let complete = entry.juan.capture_complete.unwrap_or_else(|| {
+        entry.response.status != 0
+            && entry.error.is_none()
+            && entry.juan.error.is_none()
+            && !source_partial(
+                entry.request.post_data.as_ref(),
+                entry.request.capture.as_ref(),
+            )
+            && !source_partial(Some(&entry.response.content), None)
+    });
     let evidence = Evidence {
         creator: Arc::new(entry.juan.source_creator.unwrap_or_default()),
         browser: entry.juan.source_browser.map(Arc::new),
@@ -721,6 +768,12 @@ fn convert(
         }),
         snapshot_elapsed_ms: None,
     })
+}
+
+fn source_partial(value: Option<&Value>, capture: Option<&Value>) -> bool {
+    let value = value.unwrap_or(&Value::Null);
+    let capture = capture.unwrap_or(&value["_capture"]);
+    value["_partial"] == true || capture["complete"] == false || capture["truncated"] == true
 }
 
 fn exported_body(session: &Session, evidence: &Evidence, side: Side, mode: ExportMode) -> Value {
@@ -798,6 +851,7 @@ pub(crate) fn export_entry(
         "_error": if full { session.error.as_deref() } else { session.error.as_ref().map(|_| "Source error; details omitted") },
         "_juan": { "source": "HAR", "sourceEntry": session.archive.as_ref().map(|a| a.original_id),
             "sanitized": !full,
+            "captureComplete": session.capture_complete(),
             "sourceCreator": if full { Some(evidence.creator.as_ref()) } else { None },
             "sourceBrowser": if full { evidence.browser.as_deref() } else { None },
             "timingNote": "Recorded HAR timings; not importer measurements" },
