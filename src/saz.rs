@@ -1045,7 +1045,9 @@ pub fn export(path: &Path, sessions: &[Session], mode: ExportMode) -> Result<()>
 
 pub fn write<W: Write + Seek>(output: W, sessions: &[Session], mode: ExportMode) -> Result<()> {
     ensure!(
-        sessions.iter().all(|s| s.archive.as_ref().is_none_or(|a| a.har.is_none())),
+        sessions
+            .iter()
+            .all(|s| s.archive.as_ref().is_none_or(|a| a.har.is_none())),
         "HAR-origin sessions cannot be exported to SAZ; HAR-to-SAZ conversion is deferred. Save HAR instead."
     );
     ensure!(!sessions.is_empty(), "There are no sessions to export");

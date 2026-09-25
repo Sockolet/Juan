@@ -33,7 +33,8 @@ pub fn decode_body(session: &Session, side: Side, limit: usize) -> Result<Vec<u8
         "Body exceeds the decoded preview limit"
     );
     if let Some(evidence) = session.archive.as_ref().and_then(|a| a.har.as_ref())
-        && evidence.body(side).representation != crate::har_import::Representation::Wire {
+        && evidence.body(side).representation != crate::har_import::Representation::Wire
+    {
         return Ok(data);
     }
     let encoding = header(session.headers(side), "content-encoding").unwrap_or("");
@@ -88,14 +89,16 @@ pub fn render(session: &Session, side: Side, inspector: Inspector) -> String {
     let body = session.body(side);
     let har = session.archive.as_ref().and_then(|a| a.har.as_ref());
     if body.data.is_empty()
-        && let Some(evidence) = har {
-            let mut text = crate::har_import::describe(session, evidence, side);
-            if side == Side::Request && !evidence.params.is_empty() {
-                text.push_str("\r\nStructured form parameters (not original body bytes):\r\n");
-                text.push_str(&pretty_json(&evidence.params).unwrap_or_else(|error|
-                    format!("{error}; use full HAR export for structured parameters.")));
-            }
-            return text;
+        && let Some(evidence) = har
+    {
+        let mut text = crate::har_import::describe(session, evidence, side);
+        if side == Side::Request && !evidence.params.is_empty() {
+            text.push_str("\r\nStructured form parameters (not original body bytes):\r\n");
+            text.push_str(&pretty_json(&evidence.params).unwrap_or_else(|error| {
+                format!("{error}; use full HAR export for structured parameters.")
+            }));
+        }
+        return text;
     }
     if body.data.is_empty() {
         return if session.archive.as_ref().is_some_and(|archive| {
@@ -120,7 +123,9 @@ pub fn render(session: &Session, side: Side, inspector: Inspector) -> String {
             String::from("Waiting for body data...")
         };
     }
-    let mut prefix = har.map(|e| crate::har_import::describe(session, e, side)).unwrap_or_default();
+    let mut prefix = har
+        .map(|e| crate::har_import::describe(session, e, side))
+        .unwrap_or_default();
     if har.is_some() {
         prefix.push_str("\r\n");
     } else if body.truncated() {
@@ -216,10 +221,16 @@ fn render_headers(session: &Session, side: Side) -> String {
             |s| s.to_string(),
         );
         let reason = session
-            .archive.as_ref().and_then(|a| a.har.as_ref()).map(|h| h.status_text.as_str())
-            .or_else(|| session.status
-                .and_then(|s| http::StatusCode::from_u16(s).ok())
-                .and_then(|s| s.canonical_reason()))
+            .archive
+            .as_ref()
+            .and_then(|a| a.har.as_ref())
+            .map(|h| h.status_text.as_str())
+            .or_else(|| {
+                session
+                    .status
+                    .and_then(|s| http::StatusCode::from_u16(s).ok())
+                    .and_then(|s| s.canonical_reason())
+            })
             .unwrap_or("");
         format!("{} {status} {reason}\r\n", session.response_protocol)
     };
@@ -236,7 +247,9 @@ fn render_headers(session: &Session, side: Side) -> String {
     if let Some(error) = &session.error {
         let origin = if session.archive.as_ref().is_some_and(|a| a.har.is_some()) {
             "HAR source diagnostic"
-        } else { "Juan diagnostic" };
+        } else {
+            "Juan diagnostic"
+        };
         let _ = write!(text, "\r\n--- {origin} ---\r\n{error}\r\n");
     }
     if let Some(evidence) = session.archive.as_ref().and_then(|a| a.har.as_ref()) {
@@ -284,15 +297,27 @@ pub fn render_timing(session: &Session) -> String {
     if let Some(evidence) = session.archive.as_ref().and_then(|a| a.har.as_ref()) {
         let mut text = format!(
             "HAR SOURCE SESSION #{}\r\nCreator: {} {}\r\nBrowser: {:?}\r\nServer: {}\r\nConnection: {}\r\nTotal: {} ms (-1 = unknown)\r\nRecorded browser timings, not importer measurements:\r\n",
-            session.archive.as_ref().unwrap().original_id, evidence.creator.name,
-            evidence.creator.version, evidence.browser, evidence.server_ip,
-            evidence.connection, evidence.time,
+            session.archive.as_ref().unwrap().original_id,
+            evidence.creator.name,
+            evidence.creator.version,
+            evidence.browser,
+            evidence.server_ip,
+            evidence.connection,
+            evidence.time,
         );
         for (name, value) in &evidence.timings {
             let _ = write!(text, "{name}: {value} ms\r\n");
         }
-        text.push_str(&crate::har_import::describe(session, evidence, Side::Request));
-        text.push_str(&crate::har_import::describe(session, evidence, Side::Response));
+        text.push_str(&crate::har_import::describe(
+            session,
+            evidence,
+            Side::Request,
+        ));
+        text.push_str(&crate::har_import::describe(
+            session,
+            evidence,
+            Side::Response,
+        ));
         for note in &session.archive.as_ref().unwrap().notes {
             let _ = write!(text, "\r\nNOTE: {note}\r\n");
         }

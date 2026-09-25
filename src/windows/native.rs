@@ -335,13 +335,7 @@ pub fn save_dialog(
 }
 
 pub fn open_saz_dialog(parent: HWND) -> Result<Option<PathBuf>> {
-    file_dialog(
-        parent,
-        "Open HAR or SAZ archive",
-        "",
-        FileKind::Saz,
-        false,
-    )
+    file_dialog(parent, "Open HAR or SAZ archive", "", FileKind::Saz, false)
 }
 
 fn file_dialog(

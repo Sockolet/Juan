@@ -325,17 +325,21 @@ fn emit_sessions(store: &CaptureStore, printed: &mut BTreeSet<u64>) -> Result<()
     for session in snapshot.sessions {
         if session.complete && printed.insert(session.id) {
             let mut row = serde_json::json!({
-                    "id": session.id,
-                    "method": session.method,
-                    "url": session.url,
-                    "status": session.status,
-                    "bytes": session.bytes,
-                    "elapsedMs": session.elapsed_ms,
-                    "proxyError": session.failed,
-                });
+                "id": session.id,
+                "method": session.method,
+                "url": session.url,
+                "status": session.status,
+                "bytes": session.bytes,
+                "elapsedMs": session.elapsed_ms,
+                "proxyError": session.failed,
+            });
             if let Some(har) = &session.har {
                 row["har"] = serde_json::to_value(har)?;
-                row["elapsedMs"] = if har.time >= 0.0 { serde_json::json!(har.time) } else { serde_json::Value::Null };
+                row["elapsedMs"] = if har.time >= 0.0 {
+                    serde_json::json!(har.time)
+                } else {
+                    serde_json::Value::Null
+                };
                 row["proxyError"] = serde_json::json!(false);
                 row["sourceError"] = serde_json::json!(session.failed);
             }

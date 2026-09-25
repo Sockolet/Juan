@@ -10,7 +10,9 @@ fn main() {
             if std::path::Path::new(arg)
                 .extension()
                 .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("saz") || extension.eq_ignore_ascii_case("har")) =>
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("saz") || extension.eq_ignore_ascii_case("har")
+                }) =>
         {
             juan::windows::ui::run(false, Some(std::path::PathBuf::from(arg)))
         }
