@@ -184,6 +184,7 @@ type ImportResult = std::result::Result<(PathBuf, saz::ImportedArchive), String>
 // Shared references plus narrowly scoped interior borrows allow Win32's synchronous reentrancy.
 // No mutable App reference is ever created from window user data.
 struct App {
+    high_contrast: Cell<bool>,
     hide_assets: Cell<bool>,
     review_cursor: Cell<Option<u64>>,
     find_open: Cell<bool>,
@@ -253,6 +254,7 @@ impl App {
             ),
         };
         Ok(Self {
+            high_contrast: Cell::new(true),
             hide_assets: Cell::new(troubleshoot::HIDE_ASSETS_DEFAULT),
             review_cursor: Cell::new(None),
             find_open: Cell::new(false),
@@ -313,7 +315,32 @@ impl App {
         scaled(value, self.dpi.get())
     }
 
+    fn refresh_high_contrast(&self) {
+        let mut contrast = HIGHCONTRASTW {
+            cbSize: size_of::<HIGHCONTRASTW>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: contrast has the required size and is writable for the synchronous call.
+        let success = unsafe {
+            SystemParametersInfoW(
+                SPI_GETHIGHCONTRAST,
+                contrast.cbSize,
+                (&mut contrast as *mut HIGHCONTRASTW).cast(),
+                0,
+            )
+        };
+        self.high_contrast
+            .set(high_contrast_enabled(success != 0, contrast.dwFlags));
+        if success == 0 {
+            self.store.notice(format!(
+                "Could not query high contrast; using system list colors: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
     fn initialize(&self) -> Result<()> {
+        self.refresh_high_contrast();
         let parent = self.hwnd.get();
         let button = |text, id| {
             child(
@@ -619,13 +646,12 @@ impl App {
         position(c.search, s(16), s(151), split - s(174), s(29));
         position(c.scope, split - s(150), s(150), s(138), s(240));
         position(c.hide_assets, s(16), s(183), s(220), s(26));
-        let list_top = if split >= s(460) {
+        if split >= s(460) {
             position(c.review, s(242), s(183), split - s(253), s(29));
-            218
         } else {
             position(c.review, s(16), s(213), split - s(27), s(29));
-            248
-        };
+        }
+        let list_top = list_top(split >= s(460));
         position(
             c.list,
             s(16),
@@ -2094,7 +2120,12 @@ impl App {
             );
             fill(
                 dc,
-                rect(s(15), s(247), split - s(10), height - s(42)),
+                rect(
+                    s(15),
+                    s(list_top(split >= s(460)) - 1),
+                    split - s(10),
+                    height - s(42),
+                ),
                 BORDER,
             );
             fill(
@@ -2294,17 +2325,7 @@ impl App {
                     }
                     NM_CUSTOMDRAW => {
                         let draw = &mut *(lparam as *mut NMLVCUSTOMDRAW);
-                        let mut contrast = HIGHCONTRASTW {
-                            cbSize: size_of::<HIGHCONTRASTW>() as u32,
-                            ..Default::default()
-                        };
-                        if SystemParametersInfoW(
-                            SPI_GETHIGHCONTRAST,
-                            contrast.cbSize,
-                            (&mut contrast as *mut HIGHCONTRASTW).cast(),
-                            0,
-                        ) != 0
-                            && contrast.dwFlags & HCF_HIGHCONTRASTON != 0
+                        if self.high_contrast.get()
                             && draw.nmcd.dwDrawStage == CDDS_ITEMPREPAINT | CDDS_SUBITEM
                             && draw.nmcd.uItemState & CDIS_SELECTED == 0
                         {
@@ -2703,6 +2724,12 @@ unsafe extern "system" fn window_proc(
         }
         let app = &*pointer;
         match message {
+            WM_SETTINGCHANGE => {
+                app.refresh_high_contrast();
+                if let Some(c) = app.controls.get() {
+                    InvalidateRect(c.list, null(), 1);
+                }
+            }
             WM_CREATE => match app.initialize() {
                 Ok(()) => return 0,
                 Err(error) => {
@@ -2959,6 +2986,14 @@ fn find_enter_search_control(id: i32) -> bool {
     [FIND_QUERY, REQUEST_BODY, RESPONSE_BODY]
         .into_iter()
         .any(|control| i32::from(control) == id)
+}
+
+fn list_top(wide: bool) -> i32 {
+    if wide { 218 } else { 248 }
+}
+
+fn high_contrast_enabled(query_succeeded: bool, flags: u32) -> bool {
+    !query_succeeded || flags & HCF_HIGHCONTRASTON != 0
 }
 
 fn problem_row_colors(
@@ -3260,6 +3295,16 @@ fn make_recent_menu(recent: &super::recent::RecentFiles) -> Result<HMENU> {
 #[cfg(test)]
 mod capture_start_tests {
     use super::*;
+
+    #[test]
+    fn list_geometry_and_contrast_fallback_are_consistent() {
+        assert_eq!(list_top(true), 218);
+        assert_eq!(list_top(false), 248);
+        assert!(!high_contrast_enabled(true, 0));
+        assert!(high_contrast_enabled(true, HCF_HIGHCONTRASTON));
+        assert!(high_contrast_enabled(false, 0));
+        assert!(high_contrast_enabled(false, HCF_HIGHCONTRASTON));
+    }
 
     #[test]
     fn file_menu_contains_recent_archive_commands_and_clear_history() {
