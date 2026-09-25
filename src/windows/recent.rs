@@ -57,8 +57,15 @@ impl RecentFiles {
     }
 
     /// Call only after parsing and transactional session replacement both succeed.
-    pub fn record_success(&mut self, path: &Path) -> Result<()> {
-        let path = local_archive_path(path)?;
+    pub fn record_success(&mut self, path: &Path) -> Result<bool> {
+        let absolute = std::path::absolute(path).context("Resolve recent archive path")?;
+        if !supported_path(&absolute, drive_type) {
+            return Ok(false);
+        }
+        let path = fs::canonicalize(&absolute).context("Locate recent archive")?;
+        if !supported_path(&path, drive_type) {
+            return Ok(false);
+        }
         let mut next = vec![path.clone()];
         next.extend(
             self.paths
@@ -69,7 +76,7 @@ impl RecentFiles {
         );
         self.persist(&next)?;
         self.paths = next;
-        Ok(())
+        Ok(true)
     }
 
     pub fn clear(&mut self) -> Result<()> {
@@ -101,6 +108,7 @@ impl RecentFiles {
 }
 
 pub fn local_archive_path(path: &Path) -> Result<PathBuf> {
+    validate_local(&std::path::absolute(path)?)?;
     // Resolve symlinks before checking the local-drive boundary. No file contents are read.
     let path = fs::canonicalize(path).context("Locate recent archive")?;
     validate_local(&path)?;
@@ -108,6 +116,14 @@ pub fn local_archive_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn validate_local(path: &Path) -> Result<()> {
+    ensure!(
+        supported_path(path, drive_type),
+        "Recent files accepts only Unicode HAR or SAZ paths on absolute local drives"
+    );
+    Ok(())
+}
+
+fn supported_path(path: &Path, drive_type: impl FnOnce(u8) -> u32) -> bool {
     let drive = match path.components().next() {
         Some(Component::Prefix(prefix)) => match prefix.kind() {
             Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => Some(drive),
@@ -115,30 +131,21 @@ fn validate_local(path: &Path) -> Result<()> {
         },
         _ => None,
     };
-    ensure!(
-        path.is_absolute() && drive.is_some(),
-        "Recent files accepts only absolute local-drive paths, not network or device paths"
-    );
-    let root = super::system::wide(&format!("{}:\\", drive.unwrap() as char));
-    // SAFETY: root is a terminated drive-root string and remains live for this call.
-    let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
-    ensure!(
-        // GetDriveType: absent removable root, removable, fixed, CD-ROM, RAM disk.
-        // Retain offline local-drive history, but never mapped network drives (4).
-        matches!(kind, 1 | 2 | 3 | 5 | 6),
-        "Recent files accepts only local drives"
-    );
-    ensure!(
-        path.extension()
+    let Some(drive) = drive.filter(|_| path.is_absolute()) else {
+        return false;
+    };
+    path.to_str().is_some()
+        && path.extension()
             .and_then(|p| p.to_str())
-            .is_some_and(|s| s.eq_ignore_ascii_case("har") || s.eq_ignore_ascii_case("saz")),
-        "Recent files accepts only HAR or SAZ paths"
-    );
-    ensure!(
-        path.to_str().is_some(),
-        "Recent-file path is not valid Unicode"
-    );
-    Ok(())
+            .is_some_and(|s| s.eq_ignore_ascii_case("har") || s.eq_ignore_ascii_case("saz"))
+        // Retain offline local-drive history, but never mapped network drives (4).
+        && matches!(drive_type(drive), 1 | 2 | 3 | 5 | 6)
+}
+
+fn drive_type(drive: u8) -> u32 {
+    let root = super::system::wide(&format!("{}:\\", drive as char));
+    // SAFETY: root is a terminated drive-root string and remains live for this call.
+    unsafe { GetDriveTypeW(root.as_ptr()) }
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -164,6 +171,46 @@ pub fn menu_label(path: &Path, index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_history_paths_are_skipped_without_share_access() {
+        for path in [
+            r"\\server\share\one.har",
+            r"\\?\UNC\server\share\one.har",
+            r"\\.\C:\one.har",
+            r"C:one.har",
+            r"C:\one.zip",
+        ] {
+            assert!(!supported_path(Path::new(path), |_| panic!(
+                "must not probe this path"
+            )));
+        }
+        for kind in 0..=6 {
+            assert_eq!(
+                supported_path(Path::new(r"Z:\one.har"), |_| kind),
+                matches!(kind, 1 | 2 | 3 | 5 | 6)
+            );
+        }
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut history = RecentFiles::empty(dir.path());
+        assert!(
+            !history
+                .record_success(Path::new(r"\\server\share\one.har"))
+                .unwrap()
+        );
+        assert!(
+            !history
+                .record_success(&dir.path().join("renamed.zip"))
+                .unwrap()
+        );
+        assert!(history.paths().is_empty());
+        assert!(!history.file.exists());
+        assert!(
+            history
+                .record_success(&dir.path().join("missing.har"))
+                .is_err()
+        );
+    }
 
     #[test]
     fn newest_five_deduplicate_and_roundtrip_without_contents() {

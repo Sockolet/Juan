@@ -1502,12 +1502,16 @@ impl App {
         }
         self.set_status(format!("Opened {count} archive sessions; {warnings} archive notes. See Timing and Diagnostics for fidelity details."));
         let recorded = self.recent.borrow_mut().record_success(&path);
-        if let Err(error) = recorded {
-            self.report(error.context(
+        match recorded {
+            Err(error) => self.report(error.context(
                 "Archive opened successfully, but recent-file history could not be saved",
-            ));
-        } else if let Err(error) = self.refresh_recent_menu() {
-            self.report(error);
+            )),
+            Ok(false) => self.set_status(format!(
+                "Opened {count} archive sessions; {warnings} archive notes. Recent history skipped: only local HAR/SAZ paths are supported."
+            )),
+            Ok(true) => if let Err(error) = self.refresh_recent_menu() {
+                self.report(error);
+            },
         }
         self.refresh(true);
         self.render_details(true);
