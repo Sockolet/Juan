@@ -464,6 +464,12 @@ impl<'de> Visitor<'de> for EntriesSeed {
                 return Err(S::Error::custom("HAR exceeds session retention limit"));
             }
             let id = ordinal as u64;
+            // Essential structure is document-fatal even for unsupported entries.
+            if !entry.response.content.is_object() {
+                return Err(S::Error::custom(format!(
+                    "HAR entry {id}: Response content must be an object"
+                )));
+            }
             if let Some(field) = unsupported_entry_field(&entry) {
                 imported.warnings.push(format!(
                     "HAR entry {id}: unsupported {field}; entry skipped"
@@ -670,10 +676,6 @@ fn convert(
     for phase in ["send", "wait", "receive"] {
         timings.entry(phase.into()).or_insert(-1.0);
     }
-    ensure!(
-        entry.response.content.is_object(),
-        "Response content must be an object"
-    );
     http::Method::from_bytes(entry.request.method.as_bytes()).context("Invalid request method")?;
     let started_at = OffsetDateTime::parse(&entry.started_date_time, &Rfc3339)
         .context("Invalid startedDateTime")?;

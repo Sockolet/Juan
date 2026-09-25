@@ -72,6 +72,48 @@ fn unsupported_entries_are_skipped_with_safe_original_ordinals() {
 }
 
 #[test]
+fn unsupported_entries_with_malformed_content_reject_the_document_before_replacement() {
+    let store = CaptureStore::default();
+    store
+        .replace_from_archive(parse(&sample()).sessions)
+        .unwrap();
+    let before = store.all_sessions().remove(0);
+    for (field, unsupported) in [
+        ("/request/url", json!("data:text/plain,SECRET")),
+        ("/request/url", json!("blob:https://example.test/SECRET")),
+        ("/request/method", json!("bad method")),
+        ("/startedDateTime", json!("bad timestamp")),
+        ("/response/status", json!(1000)),
+    ] {
+        for content in [json!("invalid structure"), json!(null), json!([]), json!(0)] {
+            let mut value = sample();
+            let original = value["log"]["entries"][0].clone();
+            let mut skipped = original.clone();
+            skipped["request"]["url"] = json!("data:text/plain,SECRET");
+            let mut malformed = original.clone();
+            *malformed.pointer_mut(field).unwrap() = unsupported.clone();
+            malformed["response"]["content"] = content;
+            value["log"]["entries"] = json!([original, skipped, malformed]);
+            let result = har_import::read(
+                serde_json::to_vec(&value).unwrap().as_slice(),
+                CaptureLimits::default(),
+            )
+            .and_then(|imported| store.replace_from_archive(imported.sessions));
+            let error = result.expect_err("Malformed skipped entry must reject the whole document");
+            assert!(
+                format!("{error:#}").contains("HAR entry 3: Response content must be an object"),
+                "{field}: {error:#}"
+            );
+            let retained = store.all_sessions();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].id, before.id);
+            assert_eq!(retained[0].url, before.url);
+            assert_eq!(retained[0].response.data, before.response.data);
+        }
+    }
+}
+
+#[test]
 fn missing_exported_bodies_do_not_imply_an_incomplete_exchange() {
     let mut value = sample();
     let entry = &mut value["log"]["entries"][0];
