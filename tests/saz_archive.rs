@@ -49,6 +49,19 @@ fn minimal(extra: Option<(&str, &[u8])>) -> Vec<u8> {
     }
     archive(&entries)
 }
+#[test]
+fn renamed_saz_uses_the_same_bounded_loader() {
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    for name in ["capture.zip", "capture", "capture.unknown"] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, minimal(None)).unwrap();
+        let imported = juan::archive::load(&path, Limits::default()).unwrap();
+        assert_eq!(imported.sessions.len(), 1);
+        assert_eq!(imported.sessions[0].response.data, b"hello");
+        std::fs::write(&path, b"not a ZIP archive").unwrap();
+        assert!(juan::archive::load(&path, Limits::default()).is_err());
+    }
+}
 
 fn encode(sessions: &[juan::capture::Session], mode: ExportMode) -> Vec<u8> {
     let mut output = Cursor::new(Vec::new());

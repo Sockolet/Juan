@@ -13,8 +13,8 @@ pub fn load(path: &Path, limits: saz::Limits) -> Result<saz::ImportedArchive> {
         Some(ext) if ext.eq_ignore_ascii_case("har") => {
             crate::har_import::load(path, limits.capture)
         }
-        Some(ext) if ext.eq_ignore_ascii_case("saz") => saz::load(path, limits),
-        _ => anyhow::bail!("Unsupported archive extension; select .har or .saz"),
+        // Preserve SAZ's bounded ZIP validation for renamed archives and All files.
+        _ => saz::load(path, limits),
     }
 }
 
