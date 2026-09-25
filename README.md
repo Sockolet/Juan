@@ -233,7 +233,9 @@ Reopening uses the same safe, transactional importer and replacement confirmatio
 Missing or invalid files report an error without replacing retained sessions.
 History contains paths only, never archive contents, and is stored per user in
 `%LOCALAPPDATA%\Juan\recent-files.json` using a flushed atomic replacement.
-Network/device paths and mapped network drives are not recorded. Read/write
+Network/device paths, mapped network drives, and renamed non-HAR/SAZ paths are
+not recorded; a successful import reports this skip nonmodally in the status bar.
+Actual local read/write
 failures are displayed rather than silently ignored; a history-save failure does
 not undo a successful import. **Clear history** persists an empty list without
 deleting archive files or clearing sessions.
@@ -244,7 +246,7 @@ restarting only its own isolated instance. `-Troubleshooting` saves native
 not merely a red icon or tinted background. These checks refuse to run while
 another Juan instance is open. Neither starts capture or changes proxy/trust.
 
-- **Hide assets** is checked by default, including after archive import. It hides only settled,
+- **Hide assets** is checked on fresh startup. Archive imports preserve your checkbox choice. It hides only settled,
   successful GET/HEAD responses with recognized CSS, JavaScript or common image
   MIME types (including 304 cache responses). URL suffixes are never sufficient.
   Failures, incomplete requests, missing/ambiguous MIME types and POSTs remain
@@ -278,7 +280,7 @@ another Juan instance is open. Neither starts capture or changes proxy/trust.
   content, Hex bytes or other sessions. Changing a preview invalidates the previous
   match safely; press Next to search the updated display.
 
-Defaults preserve capture chronology/current sorting and show all assets. These
+Defaults preserve capture chronology/current sorting and hide successful static assets. These
 views work with live and imported sessions and do not change evidence or exports,
 except that exports continue to include only currently visible sessions. There is
 no automatic priority sorting, request correlation, AI diagnosis, regex search or
@@ -341,9 +343,12 @@ HAR 1.2 browser exports from Chrome, Edge, Firefox and Juan are supported.
 Compatibility tests use synthetic browser-shaped fixtures and Juan-generated
 exports, not a certification of every browser release. Opening an archive
 replaces the current capture only after successful parsing and validation.
-Malformed essential structure, any invalid entry or exceeded input/session limits
-fail the whole import without replacing prior sessions. Invalid optional bodies
-produce warnings. No entries are silently skipped.
+Malformed JSON/essential structure or exceeded input/entry limits fail the whole
+import without replacing prior sessions. Unsupported request URLs (including
+`data:` and `blob:`), methods, timestamps or out-of-range statuses are skipped with
+ordinal/field-only warnings. HTTP extension statuses 100 through 999 and HAR's
+status 0 are retained. Zero importable entries is an error, never an empty replacement.
+Invalid optional bodies produce warnings. No entries are silently skipped.
 
 **Limits:** input is capped at **128 MiB (134217728 bytes)**, enforced both on the
 file length and actual reads. Retention remains **1 MiB per body, 64 MiB aggregate
@@ -358,7 +363,9 @@ desktop snapshots also consume memory.
 - HAR is browser-exported evidence, not reconstructed wire capture. Inspectors,
   Timing and CLI `har` metadata distinguish UTF-8 text, decoded binary, Juan wire
   fallback, missing, omitted, partial and locally truncated bodies. Explicit
-  empty text is a present empty body, not a missing one.
+  empty text is a present empty body, not a missing one. Missing exported bodies
+  alone do not mark an exchange incomplete; explicit partial/source-failure
+  evidence remains separate from body availability.
 - Browser content (including base64) is already decoded. A retained
   `Content-Encoding: gzip` header does not trigger a second decompression.
   Reported wire/body size and decoded size stay separate from retained bytes;
@@ -415,7 +422,13 @@ does not start the listener, change proxy routing, or install certificate trust.
 **Save:** use **File > Save SAZ (sensitive)** for headers and retained body bytes,
 or **File > Save sanitized SAZ** to omit bodies and redact common credentials.
 Existing **Save HAR / Ctrl+S** behavior is unchanged. Exports include the currently
-visible session snapshot.
+visible session snapshot. Both full and sanitized desktop exports confirm the
+visible/exported count, asset-hidden count, and other filter/scope exclusions
+from the same frozen snapshot. Cancelling leaves existing files and sessions intact.
+Uncheck Hide assets and clear other filters to include all retained sessions.
+
+Renamed SAZ files (for example `capture.zip`, or files chosen via All files) use
+the same bounded SAZ parser; non-HAR extensions do not bypass ZIP validation.
 
 The CLI selects SAZ for a `.saz` output filename; other output names retain the
 previous HAR behavior. CLI exports are sanitized unless `--full` is supplied;
