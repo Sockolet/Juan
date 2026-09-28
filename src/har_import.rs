@@ -470,14 +470,23 @@ impl<'de> Visitor<'de> for EntriesSeed {
                     "HAR entry {id}: Response content must be an object"
                 )));
             }
-            if let Some(field) = unsupported_entry_field(&entry) {
-                imported.warnings.push(format!(
-                    "HAR entry {id}: unsupported {field}; entry skipped"
-                ));
-                continue;
-            }
-            let session = convert(entry, id, self.0, &mut remaining, &mut imported.warnings)
-                .map_err(|e| S::Error::custom(format!("HAR entry {id}: {e:#}")))?;
+            let validated = match validate_entry(&entry) {
+                Ok(validated) => validated,
+                Err(field) => {
+                    imported.warnings.push(format!(
+                        "HAR entry {id}: unsupported {field}; entry skipped"
+                    ));
+                    continue;
+                }
+            };
+            let session = convert(
+                entry,
+                validated,
+                id,
+                self.0,
+                &mut remaining,
+                &mut imported.warnings,
+            );
             imported.sessions.push(session);
         }
         if imported.sessions.is_empty() {
@@ -620,31 +629,40 @@ fn decode_prefix(text: &str, keep: usize) -> std::io::Result<(Vec<u8>, u64)> {
     Ok((bytes, count))
 }
 
-fn unsupported_entry_field(entry: &Entry) -> Option<&'static str> {
+struct Validated {
+    uri: http::Uri,
+    started_at: OffsetDateTime,
+}
+
+/// The single source of entry-level import rules; failures skip only that entry.
+fn validate_entry(entry: &Entry) -> std::result::Result<Validated, &'static str> {
     if http::Method::from_bytes(entry.request.method.as_bytes()).is_err() {
-        return Some("request.method");
+        return Err("request.method");
     }
-    match entry.request.url.parse::<http::Uri>() {
+    let uri = match entry.request.url.parse::<http::Uri>() {
         Ok(uri)
-            if matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some() => {}
-        _ => return Some("request.url"),
-    }
+            if matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some() =>
+        {
+            uri
+        }
+        _ => return Err("request.url"),
+    };
     if entry.response.status != 0 && !(100..=999).contains(&entry.response.status) {
-        return Some("response.status");
+        return Err("response.status");
     }
-    if OffsetDateTime::parse(&entry.started_date_time, &Rfc3339).is_err() {
-        return Some("startedDateTime");
-    }
-    None
+    let started_at =
+        OffsetDateTime::parse(&entry.started_date_time, &Rfc3339).map_err(|_| "startedDateTime")?;
+    Ok(Validated { uri, started_at })
 }
 
 fn convert(
     mut entry: Entry,
+    Validated { uri, started_at }: Validated,
     id: u64,
     limits: CaptureLimits,
     remaining: &mut usize,
     warnings: &mut Vec<String>,
-) -> Result<Session> {
+) -> Session {
     let elapsed = entry.time.normalized(id, "time", warnings);
     if entry.timings.invalid_container {
         warnings.push(format!(
@@ -676,18 +694,6 @@ fn convert(
     for phase in ["send", "wait", "receive"] {
         timings.entry(phase.into()).or_insert(-1.0);
     }
-    http::Method::from_bytes(entry.request.method.as_bytes()).context("Invalid request method")?;
-    let started_at = OffsetDateTime::parse(&entry.started_date_time, &Rfc3339)
-        .context("Invalid startedDateTime")?;
-    let uri: http::Uri = entry.request.url.parse().context("Invalid request URL")?;
-    ensure!(
-        uri.scheme().is_some() && uri.authority().is_some(),
-        "Expected absolute request URL"
-    );
-    ensure!(
-        entry.response.status == 0 || (100..=999).contains(&entry.response.status),
-        "Invalid response status"
-    );
     let host = uri.host().unwrap_or("").to_owned();
     let path = uri
         .path_and_query()
@@ -754,7 +760,7 @@ fn convert(
         request_headers_size: entry.request.headers_size,
         response_headers_size: entry.response.headers_size,
     };
-    Ok(Session {
+    Session {
         id, method: entry.request.method, url: entry.request.url, host, path,
         protocol: entry.request.http_version, response_protocol: entry.response.http_version,
         client: String::new(), kind: SessionKind::Http, started_at: Some(started_at),
@@ -769,7 +775,7 @@ fn convert(
             ], complete,
         }),
         snapshot_elapsed_ms: None,
-    })
+    }
 }
 
 fn source_partial(value: Option<&Value>, capture: Option<&Value>) -> bool {

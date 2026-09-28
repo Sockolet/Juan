@@ -1,4 +1,4 @@
-use std::{fs::File, path::Path};
+use std::{fs::File, io::Read, path::Path};
 
 use anyhow::{Context, Result};
 
@@ -9,13 +9,30 @@ use crate::{
 };
 
 pub fn load(path: &Path, limits: saz::Limits) -> Result<saz::ImportedArchive> {
-    match path.extension().and_then(|s| s.to_str()) {
-        Some(ext) if ext.eq_ignore_ascii_case("har") => {
-            crate::har_import::load(path, limits.capture)
-        }
+    let extension = path.extension().and_then(|s| s.to_str());
+    let har = match extension {
+        Some(ext) if ext.eq_ignore_ascii_case("har") => true,
+        Some(ext) if ext.eq_ignore_ascii_case("saz") => false,
+        _ => looks_like_json(path)?,
+    };
+    if har {
+        crate::har_import::load(path, limits.capture)
+    } else {
         // Preserve SAZ's bounded ZIP validation for renamed archives and All files.
-        _ => saz::load(path, limits),
+        saz::load(path, limits)
     }
+}
+
+// Renamed HARs (for example .json) begin with an object; anything else is validated as SAZ.
+fn looks_like_json(path: &Path) -> Result<bool> {
+    let mut prefix = Vec::new();
+    File::open(path)
+        .with_context(|| format!("Open archive {}", path.display()))?
+        .take(1024)
+        .read_to_end(&mut prefix)
+        .context("Read archive prefix")?;
+    let text = prefix.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&prefix);
+    Ok(text.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{'))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

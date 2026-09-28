@@ -421,14 +421,18 @@ does not start the listener, change proxy routing, or install certificate trust.
 
 **Save:** use **File > Save SAZ (sensitive)** for headers and retained body bytes,
 or **File > Save sanitized SAZ** to omit bodies and redact common credentials.
-Existing **Save HAR / Ctrl+S** behavior is unchanged. Exports include the currently
-visible session snapshot. Both full and sanitized desktop exports confirm the
-visible/exported count, asset-hidden count, and other filter/scope exclusions
-from the same frozen snapshot. Cancelling leaves existing files and sessions intact.
-Uncheck Hide assets and clear other filters to include all retained sessions.
+All desktop exports, including **Save HAR / Ctrl+S**, write the displayed rows in
+their displayed order. Before the file dialog, both full and sanitized exports
+show a confirmation with the exported count, asset-hidden count, and other
+filter/scope exclusions computed with those displayed rows. Cancelling leaves
+existing files and sessions intact. Uncheck Hide assets and clear other filters
+to include all retained sessions.
 
-Renamed SAZ files (for example `capture.zip`, or files chosen via All files) use
-the same bounded SAZ parser; non-HAR extensions do not bypass ZIP validation.
+Files without a `.har` or `.saz` extension (for example `capture.zip`,
+`capture.json`, or files chosen via All files) are opened as HAR when their first
+non-whitespace byte (after an optional UTF-8 BOM) is `{`; otherwise they use the
+same bounded SAZ parser, so renamed files never bypass ZIP validation. A `.saz`
+file is always parsed as SAZ.
 
 The CLI selects SAZ for a `.saz` output filename; other output names retain the
 previous HAR behavior. CLI exports are sanitized unless `--full` is supplied;

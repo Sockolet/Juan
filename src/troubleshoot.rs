@@ -1,6 +1,6 @@
 //! Deterministic view-only helpers; never infer causes or alter captured evidence.
 use crate::{
-    capture::{Session, SessionKind, SessionSummary},
+    capture::{SessionKind, SessionSummary},
     filter::Filter,
 };
 
@@ -18,42 +18,44 @@ pub fn matches_view(row: &SessionSummary, filter: &Filter, scope: usize) -> bool
         }
 }
 
-pub struct ExportSnapshot {
-    pub sessions: Vec<Session>,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Excluded {
     pub asset_hidden: usize,
     pub other_excluded: usize,
 }
 
-impl ExportSnapshot {
-    pub fn counts_message(&self) -> String {
+impl Excluded {
+    pub fn counts_message(self, exported: usize) -> String {
         format!(
-            "Export {} visible sessions from this snapshot.\nExcluded: {} hidden by Hide assets; {} excluded by other filters/scope.\nHidden/excluded sessions will NOT be exported.",
-            self.sessions.len(),
-            self.asset_hidden,
-            self.other_excluded
+            "Export {exported} visible sessions from this snapshot.\nExcluded: {} hidden by Hide assets; {} excluded by other filters/scope.\nHidden/excluded sessions will NOT be exported.",
+            self.asset_hidden, self.other_excluded
         )
     }
 }
 
-pub fn export_snapshot(
-    sessions: Vec<Session>,
+/// The displayed rows and exclusion counts; desktop exports reuse both unchanged.
+pub struct ViewSnapshot {
+    pub rows: Vec<SessionSummary>,
+    pub excluded: Excluded,
+}
+
+pub fn view_snapshot(
+    rows: Vec<SessionSummary>,
     filter: &Filter,
     scope: usize,
     hide_assets: bool,
-) -> ExportSnapshot {
-    let mut snapshot = ExportSnapshot {
-        sessions: Vec::new(),
-        asset_hidden: 0,
-        other_excluded: 0,
+) -> ViewSnapshot {
+    let mut snapshot = ViewSnapshot {
+        rows: Vec::new(),
+        excluded: Excluded::default(),
     };
-    for session in sessions {
-        let row = session.summary();
+    for row in rows {
         if !matches_view(&row, filter, scope) {
-            snapshot.other_excluded += 1;
+            snapshot.excluded.other_excluded += 1;
         } else if hide_assets && static_asset(&row) {
-            snapshot.asset_hidden += 1;
+            snapshot.excluded.asset_hidden += 1;
         } else {
-            snapshot.sessions.push(session);
+            snapshot.rows.push(row);
         }
     }
     snapshot

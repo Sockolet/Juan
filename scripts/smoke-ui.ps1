@@ -666,7 +666,9 @@ try {
         Write-Output 'SAZ UI smoke passed: offline startup import, body inspector, native Save SAZ, read-back, sensitive export cancellation, and Open SAZ cancellation.'
         return
     }
-    Wait-Until { (Get-RowCount $list) -eq 12 } 'The native session list did not load the twelve demo sessions.'
+    # Hide assets is on by default: the CSS, JavaScript and PNG demo sessions are hidden.
+    Wait-Until { (Get-RowCount $list) -eq 9 } 'The native session list did not load the nine visible demo sessions.'
+    Assert-That ((Get-ControlText ([JuanUiSmoke]::GetDlgItem($window, 213))) -eq 'Hide assets (3 hidden)') 'Hide assets did not report the three hidden demo assets.'
     Assert-That ((Get-ControlText $response).Contains('Access token expired')) 'The selected response did not appear in the JSON inspector.'
     $process.Refresh()
     $idleMiB = [math]::Round($process.WorkingSet64 / 1MB, 1)
@@ -715,7 +717,7 @@ try {
     Set-ControlText $search 'status:700'
     Wait-Until { (Get-RowCount $list) -eq 0 } 'Invalid filters should not silently show unfiltered traffic.'
     Set-ControlText $search ''
-    Wait-Until { (Get-RowCount $list) -eq 12 } 'Clearing the filter did not restore the session list.'
+    Wait-Until { (Get-RowCount $list) -eq 9 } 'Clearing the filter did not restore the session list.'
 
     $reservation = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $reservation.Start()
@@ -728,7 +730,7 @@ try {
     Select-CaptureOption $setup 2
     Wait-Until { ([JuanUiSmoke]::GetLastActivePopup($window)) -eq $window } 'Cancelling capture setup did not dismiss the dialog.'
     Assert-That (-not (Test-Listening $port)) 'Cancelling capture setup left a listener running.'
-    Assert-That ((Get-RowCount $list) -eq 12) 'Cancelling capture setup cleared the existing sessions.'
+    Assert-That ((Get-RowCount $list) -eq 9) 'Cancelling capture setup cleared the existing sessions.'
     $setup = Open-CaptureSetup $window
     Select-CaptureOption $setup 1002
     Wait-Until { Test-Listening $port } 'The Start capture button did not start the listener.'

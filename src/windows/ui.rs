@@ -185,7 +185,9 @@ type ImportResult = std::result::Result<(PathBuf, saz::ImportedArchive), String>
 // No mutable App reference is ever created from window user data.
 struct App {
     high_contrast: Cell<bool>,
+    high_contrast_error: Cell<bool>,
     hide_assets: Cell<bool>,
+    excluded: Cell<troubleshoot::Excluded>,
     review_cursor: Cell<Option<u64>>,
     find_open: Cell<bool>,
     find_target: Cell<usize>,
@@ -255,7 +257,9 @@ impl App {
         };
         Ok(Self {
             high_contrast: Cell::new(true),
+            high_contrast_error: Cell::new(false),
             hide_assets: Cell::new(troubleshoot::HIDE_ASSETS_DEFAULT),
+            excluded: Cell::new(troubleshoot::Excluded::default()),
             review_cursor: Cell::new(None),
             find_open: Cell::new(false),
             find_target: Cell::new(1),
@@ -331,11 +335,14 @@ impl App {
         };
         self.high_contrast
             .set(high_contrast_enabled(success != 0, contrast.dwFlags));
-        if success == 0 {
+        // WM_SETTINGCHANGE is frequent; report only the first failure of a failing streak.
+        if success == 0 && !self.high_contrast_error.replace(true) {
             self.store.notice(format!(
                 "Could not query high contrast; using system list colors: {}",
                 std::io::Error::last_os_error()
             ));
+        } else if success != 0 {
+            self.high_contrast_error.set(false);
         }
     }
 
@@ -1376,24 +1383,15 @@ impl App {
             self.filter_error.borrow().is_none(),
             "Correct the invalid filter before exporting"
         );
-        let snapshot = troubleshoot::export_snapshot(
-            self.store.all_sessions(),
-            &self.filter.borrow(),
-            self.scope.get(),
-            self.hide_assets.get(),
-        );
+        // Export exactly the displayed rows, in display order, with the counts computed with them.
+        let ids: Vec<_> = self.rows.borrow().iter().map(|row| row.id).collect();
+        ensure!(!ids.is_empty(), "There are no visible sessions to export");
+        let sessions = self.store.sessions(&ids);
         ensure!(
-            !snapshot.sessions.is_empty(),
-            "There are no visible sessions to export"
+            sessions.len() == ids.len(),
+            "Some visible sessions were evicted before the export snapshot. Pause capture, refresh the view, and export again."
         );
-        let counts = snapshot.counts_message();
-        let mut sessions = snapshot.sessions;
-        let (column, ascending) = self.sort.get();
-        sessions.sort_by(|a, b| {
-            let order =
-                compare_rows(&a.summary(), &b.summary(), column).then_with(|| a.id.cmp(&b.id));
-            if ascending { order } else { order.reverse() }
-        });
+        let counts = self.excluded.get().counts_message(sessions.len());
         ensure!(
             format != Format::Saz
                 || sessions
@@ -1657,25 +1655,28 @@ impl App {
             .filter(|row| row.is_error())
             .count();
         let old_count = self.rows.borrow().len();
-        let mut hidden = 0;
-        let mut rows: Vec<_> = if self.filter_error.borrow().is_some() {
-            Vec::new()
+        let view = if self.filter_error.borrow().is_some() {
+            troubleshoot::ViewSnapshot {
+                rows: Vec::new(),
+                excluded: troubleshoot::Excluded {
+                    asset_hidden: 0,
+                    other_excluded: total,
+                },
+            }
         } else {
-            let filter = self.filter.borrow();
-            snapshot
-                .sessions
-                .into_iter()
-                .filter(|row| troubleshoot::matches_view(row, &filter, self.scope.get()))
-                .filter(|row| {
-                    let hide = self.hide_assets.get() && troubleshoot::static_asset(row);
-                    if hide {
-                        hidden += 1;
-                    }
-                    !hide
-                })
-                .collect()
+            troubleshoot::view_snapshot(
+                snapshot.sessions,
+                &self.filter.borrow(),
+                self.scope.get(),
+                self.hide_assets.get(),
+            )
         };
-        set_text(c.hide_assets, &format!("Hide assets ({hidden} hidden)"));
+        self.excluded.set(view.excluded);
+        let mut rows = view.rows;
+        set_text(
+            c.hide_assets,
+            &format!("Hide assets ({} hidden)", view.excluded.asset_hidden),
+        );
         let order = troubleshoot::review_order(&rows);
         set_text(c.review, &format!("Review first ({} visible)", order.len()));
         enable(c.review, !order.is_empty());
