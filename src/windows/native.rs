@@ -335,13 +335,7 @@ pub fn save_dialog(
 }
 
 pub fn open_saz_dialog(parent: HWND) -> Result<Option<PathBuf>> {
-    file_dialog(
-        parent,
-        "Open Fiddler session archive",
-        "",
-        FileKind::Saz,
-        false,
-    )
+    file_dialog(parent, "Open HAR or SAZ archive", "", FileKind::Saz, false)
 }
 
 fn file_dialog(
@@ -368,6 +362,11 @@ fn file_dialog(
             "Fiddler session archive (*.saz)\0*.saz\0All files (*.*)\0*.*\0\0",
             "saz",
         ),
+    };
+    let filter = if !save {
+        "HTTP archives (*.har;*.saz)\0*.har;*.saz\0All files (*.*)\0*.*\0\0"
+    } else {
+        filter
     };
     let filter: Vec<u16> = filter.encode_utf16().collect();
     let title = wide(title);

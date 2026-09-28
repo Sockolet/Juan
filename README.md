@@ -44,7 +44,7 @@ choice. Version 0.1.0 started only the listener.
 | Inspectors | Request/response headers and trailers, UTF-8 text, formatted JSON, original body bytes in Hex, measured timings, diagnostic messages |
 | Compression | Bounded gzip, zlib-deflate, and Brotli decoding for inspection and export only |
 | Filtering | Text search, host, method, status/range, content type, scheme, errors, negation, and quick scope filters |
-| Archives | Native unencrypted SAZ import/export, SAZView-compatible index, and HAR 1.2 export; explicit partial-capture metadata and sensitive-export confirmation |
+| Archives | Native unencrypted SAZ import/export, SAZView-compatible index, HAR 1.2 import/export; explicit source/body provenance and sensitive-export confirmation |
 | Upgrades | HTTP/1.1 WebSocket handshake capture and transparent bidirectional relay; frames are not decoded |
 | Windows integration | Explicit current-user proxy routing, saved settings and crash recovery, explicit current-user CA trust/removal |
 | Headless | A separate CLI with JSON-line session summaries, timed capture, HAR export, and CA management |
@@ -224,12 +224,79 @@ Prefix a term with `-` to negate it. Invalid field expressions are visibly rejec
 they do not silently fall back to unfiltered results. Quoted phrases, regexes,
 and arbitrary query expressions are not implemented.
 
+### Troubleshooting views
+
+**File > Recent files** keeps the five most recently **successfully opened** HAR
+or SAZ archives, newest first, deduplicated case-insensitively by absolute path.
+Each menu entry includes its filename and full local path to disambiguate names.
+Reopening uses the same safe, transactional importer and replacement confirmation.
+Missing or invalid files report an error without replacing retained sessions.
+History contains paths only, never archive contents, and is stored per user in
+`%LOCALAPPDATA%\Juan\recent-files.json` using a flushed atomic replacement.
+Network/device paths, mapped network drives, and renamed non-HAR/SAZ paths are
+not recorded; a successful import reports this skip nonmodally in the status bar.
+Actual local read/write
+failures are displayed rather than silently ignored; a history-save failure does
+not undo a successful import. **Clear history** persists an empty list without
+deleting archive files or clearing sessions.
+
+Synthetic native checks: `scripts\smoke-ui.ps1 -RecentFiles` exercises history,
+restarting only its own isolated instance. `-Troubleshooting` saves native
+400/500/transport screenshots and requires actual red foreground glyph pixels,
+not merely a red icon or tinted background. These checks refuse to run while
+another Juan instance is open. Neither starts capture or changes proxy/trust.
+
+- **Hide assets** is checked on fresh startup. Archive imports preserve your checkbox choice. It hides only settled,
+  successful GET/HEAD responses with recognized CSS, JavaScript or common image
+  MIME types (including 304 cache responses). URL suffixes are never sufficient.
+  Failures, incomplete requests, missing/ambiguous MIME types and POSTs remain
+  visible. Conflicting Content-Type headers or HAR MIME metadata prevent hiding.
+  Its compact caption reports the hidden count within the current filter/scope.
+  Uncheck this sole visibility control to restore assets without clearing other
+  filters. There is no separate Restore button or menu action. Nothing is deleted.
+- **Result** retains the numeric status and numeric sorting, with a compact native
+  error icon (no emoji font required). Every HTTP 4xx, including 400, every 5xx,
+  and recorded transport/source failure receives red whole-row emphasis.
+  Unselected error cells explicitly draw their foreground text in red, skipping
+  the themed default text pass. This is not only a background tint or status icon.
+  Hover a row or inspect its response/timing details for concise explanations such
+  as `400 Bad Request`. Authentication challenges (401/407) may be expected.
+  Selected rows keep native selection colors; high-contrast rows use system colors.
+  Missing response bodies alone are not errors.
+- **Review first** counts only visible candidates. Clicking cycles deterministically
+  through recorded transport/source errors, 5xx, 429, 403, authentication challenges,
+  then other 4xx, with original session ID as tie-breaker. It navigates without
+  changing your filters or row order. These are bounded evidence labels, never
+  inferred causes, body excerpts or credential summaries. Clear filters explicitly
+  if you want to review the entire capture.
+- **Ctrl+F** finds literal text in the focused request/response Headers, Text or JSON
+  preview. The bar remembers the last message pane when focus is elsewhere.
+  Matching defaults to case-insensitive Unicode lowercase comparison; Match case
+  switches to exact matching. Enter/F3 advances, Shift+Enter/Shift+F3 goes backward,
+  and Escape closes the bar and returns focus to the message. The current match is
+  selected using native UTF-16 offsets; the bar reports counts, wrapping and misses.
+  Search is restricted to displayed text, capped at its first 2 MiB and first
+  10000 matches with explicit feedback. It does not search omitted/unretained
+  content, Hex bytes or other sessions. Changing a preview invalidates the previous
+  match safely; press Next to search the updated display.
+
+Defaults preserve capture chronology/current sorting and hide successful static assets. These
+views work with live and imported sessions and do not change evidence or exports,
+except that exports continue to include only currently visible sessions. There is
+no automatic priority sorting, request correlation, AI diagnosis, regex search or
+global body scan. Native offline regression coverage is available through
+`.\scripts\smoke-ui.ps1 -Troubleshooting`.
+
 | Shortcut | Action |
 | --- | --- |
-| Ctrl+O | Open a SAZ archive while the proxy is stopped |
+| Ctrl+O | Open a HAR or SAZ archive while the proxy is stopped |
 | F12 | Start, pause, or resume capture |
 | Shift+F12 | Stop the proxy |
 | Ctrl+L | Focus the filter |
+| Ctrl+F | Find in the focused/last request or response preview |
+| F3 / Shift+F3 | Next / previous match in the message preview |
+| Enter / Shift+Enter in Find | Next / previous match |
+| Escape in Find | Close Find and return to the message |
 | Ctrl+S | Save visible sessions as sanitized HAR |
 | Ctrl+Shift+S | Save full HAR after a sensitivity warning |
 | Ctrl+Delete | Clear retained sessions |
@@ -259,9 +326,89 @@ HAR export includes retained sessions only, not already-evicted traffic.
 `cert trust`, `cert remove`, and `cert reset` require typed confirmation.
 Only one Juan desktop/capturing CLI instance runs per Windows session.
 
+## Browser HAR archives
+
+Stop the listener, then use **File > Open HAR or SAZ** or **Ctrl+O**, or pass a
+`.har` filename to the desktop. CLI inspection runs offline without starting a
+listener, recovering proxy settings, or changing certificate trust:
+
+```powershell
+.\juan.exe .\browser-capture.har
+.\juan-cli.exe inspect .\browser-capture.har
+.\juan-cli.exe inspect .\browser-capture.har --export .\sanitized.har
+.\juan-cli.exe inspect .\browser-capture.har --export .\full.har --full
+```
+
+HAR 1.2 browser exports from Chrome, Edge, Firefox and Juan are supported.
+Compatibility tests use synthetic browser-shaped fixtures and Juan-generated
+exports, not a certification of every browser release. Opening an archive
+replaces the current capture only after successful parsing and validation.
+Malformed JSON/essential structure or exceeded input/entry limits fail the whole
+import without replacing prior sessions. Unsupported request URLs (including
+`data:` and `blob:`), methods, timestamps or out-of-range statuses are skipped with
+ordinal/field-only warnings. HTTP extension statuses 100 through 999 and HAR's
+status 0 are retained. Zero importable entries is an error, never an empty replacement.
+Invalid optional bodies produce warnings. No entries are silently skipped.
+
+**Limits:** input is capped at **128 MiB (134217728 bytes)**, enforced both on the
+file length and actual reads. Retention remains **1 MiB per body, 64 MiB aggregate
+body bytes, and 1000 sessions**. Body retention overflow keeps a marked prefix,
+not an invented complete body. Entries are parsed incrementally and unretained
+base64 tails are validated without retaining them. The input ceiling is **not a
+total RAM guarantee**: JSON strings, headers, structured parameters, parsing and
+desktop snapshots also consume memory.
+
+**Fidelity:**
+
+- HAR is browser-exported evidence, not reconstructed wire capture. Inspectors,
+  Timing and CLI `har` metadata distinguish UTF-8 text, decoded binary, Juan wire
+  fallback, missing, omitted, partial and locally truncated bodies. Explicit
+  empty text is a present empty body, not a missing one. Missing exported bodies
+  alone do not mark an exchange incomplete; explicit partial/source-failure
+  evidence remains separate from body availability.
+- Browser content (including base64) is already decoded. A retained
+  `Content-Encoding: gzip` header does not trigger a second decompression.
+  Reported wire/body size and decoded size stay separate from retained bytes;
+  `-1` means unknown. CLI `bytes` is the available stored representation length
+  for HAR, **not** a network-transfer measurement.
+- Request `postData.params` stays structured evidence, visible in the body
+  inspector and full exports. Juan never invents multipart boundaries or
+  original body bytes from these parameters.
+- Original URLs and ordered duplicate headers are preserved in full exports.
+  Protocol labels, status/reason, creator/browser, server/connection metadata,
+  declared body/header sizes and fractional/unknown timing phases are retained.
+  Optional anomalous timing values (including browser-produced negative phases
+  other than `-1`, wrong types, or values outside the supported duration range)
+  become unknown (`-1`) with field-specific warnings, not zero or estimated time.
+  Valid phases and recorded total remain independent; totals are never recomputed.
+  Negative reported body/header sizes other than the unknown sentinel `-1` also
+  become unknown with warnings; they never replace the retained byte counts.
+  Invalid JSON, non-finite numeric literals and essential structure errors still
+  fail transactionally.
+  Server IP is not presented as the client endpoint. Status zero is not HTTP 200.
+- Recognized Juan body omission, completion, partial, wire-base64 and error
+  metadata is honored. Unknown vendor extensions, pages, cache details,
+  structured cookie/query arrays, replay, merging and WebSocket frames are not
+  imported. URL query text and Cookie headers, when present, remain available.
+  No URL, file attachment or remote resource referenced inside the HAR is fetched.
+- Sanitized HAR export omits bodies, form values and source error details, and
+  uses existing credential-header/query redaction. It is **not anonymization**:
+  review URLs, paths and custom headers before sharing. Full export is sensitive.
+  Full/sanitized re-export preserves the distinction between unknown data and
+  retained evidence, without manufacturing timing phases.
+
+**HAR-to-SAZ conversion is deferred.** Both full and sanitized SAZ export reject
+HAR-origin sessions with a clear error. Save HAR instead. Live capture and
+existing SAZ behavior are unchanged. Opening HAR does not start capture or install
+trust; ordinary desktop startup retains its existing crash-recovery behavior.
+
+Validation uses `cargo test --locked --test har_archive --test har_cli` and
+`.\scripts\smoke-ui.ps1 -Har` (release build required). The smoke runner isolates
+its profile under `target` and checks proxy settings and root trust remain unchanged.
+
 ## Fiddler SAZ archives
 
-**Open:** stop the listener, then use **File > Open SAZ** or **Ctrl+O**. You can
+**Open:** stop the listener, then use **File > Open HAR or SAZ** or **Ctrl+O**. You can
 also pass a `.saz` filename to `juan.exe`. A successful import replaces retained
 sessions after confirmation; cancellation or an invalid archive leaves the
 previous sessions intact. Imports run in a background worker. Opening an archive
@@ -274,8 +421,18 @@ does not start the listener, change proxy routing, or install certificate trust.
 
 **Save:** use **File > Save SAZ (sensitive)** for headers and retained body bytes,
 or **File > Save sanitized SAZ** to omit bodies and redact common credentials.
-Existing **Save HAR / Ctrl+S** behavior is unchanged. Exports include the currently
-visible session snapshot.
+All desktop exports, including **Save HAR / Ctrl+S**, write the displayed rows in
+their displayed order. Before the file dialog, both full and sanitized exports
+show a confirmation with the exported count, asset-hidden count, and other
+filter/scope exclusions computed with those displayed rows. Cancelling leaves
+existing files and sessions intact. Uncheck Hide assets and clear other filters
+to include all retained sessions.
+
+Files without a `.har` or `.saz` extension (for example `capture.zip`,
+`capture.json`, or files chosen via All files) are opened as HAR when their first
+non-whitespace byte (after an optional UTF-8 BOM) is `{`; otherwise they use the
+same bounded SAZ parser, so renamed files never bypass ZIP validation. A `.saz`
+file is always parsed as SAZ.
 
 The CLI selects SAZ for a `.saz` output filename; other output names retain the
 previous HAR behavior. CLI exports are sanitized unless `--full` is supplied;
@@ -309,7 +466,7 @@ acquire the capture-instance lock or run proxy recovery.
 - `SessionTimers` attributes and `SessionFlags` are retained in full SAZ exports.
   Additional nonempty metadata sections are explicitly noted as unsupported.
   Missing or invalid start/duration information stays unavailable. **HAR export
-  requires a recorded start time and duration**; save SAZ instead when either is
+  from SAZ requires a recorded start time and duration**; save SAZ instead when either is
   unknown.
 - `_index.htm` contains safely escaped values and links understood by SAZView.
   Native import reads raw messages and XML only: it does not render or execute
@@ -457,6 +614,8 @@ Package a portable ZIP and SHA-256 checksum:
 
 ```powershell
 .\scripts\package.ps1
+# Keep a corrected preview separate from existing portable packages:
+.\scripts\package.ps1 -PackageName juan-0.3.1-ui-corrections-preview-20260924
 ```
 
 Artifacts go to `dist`. GitHub Actions is configured to format-check, lint, test,

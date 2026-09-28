@@ -1,7 +1,11 @@
 param(
     [string]$Executable = (Join-Path $PSScriptRoot '..\target\release\juan.exe'),
     [string]$Screenshot,
-    [switch]$Saz
+    [switch]$Saz,
+    [switch]$Har,
+    [switch]$HarBom,
+    [switch]$Troubleshooting,
+    [switch]$RecentFiles
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,6 +44,24 @@ public static class JuanUiSmoke {
     public static extern int GetDlgCtrlID(IntPtr window);
     [DllImport("user32.dll")]
     public static extern bool IsWindowEnabled(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr window);
+    public static string Describe(IntPtr window) {
+        var result = new StringBuilder();
+        var text = new StringBuilder(2048);
+        var cls = new StringBuilder(128);
+        GetWindowTextW(window, text, text.Capacity);
+        GetClassNameW(window, cls, cls.Capacity);
+        result.AppendLine("Window " + window + " class=" + cls + " text=" + text);
+        EnumChildWindows(window, (child, _) => {
+            text.Clear(); cls.Clear();
+            GetWindowTextW(child, text, text.Capacity);
+            GetClassNameW(child, cls, cls.Capacity);
+            result.AppendLine("Child " + child + " id=" + GetDlgCtrlID(child) + " class=" + cls + " visible=" + IsWindowVisible(child) + " text=" + text);
+            return true;
+        }, IntPtr.Zero);
+        return result.ToString();
+    }
     [DllImport("user32.dll", EntryPoint="SendMessageW")]
     public static extern IntPtr Send(IntPtr hwnd, uint message, IntPtr wparam, IntPtr lparam);
     [DllImport("user32.dll", EntryPoint="SendMessageW", CharSet=CharSet.Unicode)]
@@ -52,6 +74,14 @@ public static class JuanUiSmoke {
     public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
     [DllImport("user32.dll")]
     public static extern bool PrintWindow(IntPtr hwnd, IntPtr dc, uint flags);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetMenu(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetSubMenu(IntPtr menu, int position);
+    [DllImport("user32.dll")]
+    public static extern int GetMenuItemCount(IntPtr menu);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    public static extern int GetMenuStringW(IntPtr menu, uint item, StringBuilder text, int count, uint flags);
     public static IntPtr FindButton(IntPtr parent, string caption) {
         IntPtr found = IntPtr.Zero;
         EnumChildWindows(parent, (child, _) => {
@@ -115,6 +145,50 @@ function Get-RootTrustSnapshot {
 
 function Assert-That([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
+}
+
+function Assert-RenderedErrorText([IntPtr]$List, [string]$Name, [string]$Directory, [bool]$ExpectRed = $true) {
+    $bounds = [JuanUiSmoke+RECT]::new()
+    Assert-That ([JuanUiSmoke]::GetWindowRect($List, [ref]$bounds)) 'Cannot measure synthetic list.'
+    $image = [System.Drawing.Bitmap]::new($bounds.Right - $bounds.Left, $bounds.Bottom - $bounds.Top)
+    $graphics = [System.Drawing.Graphics]::FromImage($image)
+    try {
+        $dc = $graphics.GetHdc()
+        try { Assert-That ([JuanUiSmoke]::PrintWindow($List, $dc, 0)) 'Cannot render native error list.' }
+        finally { $graphics.ReleaseHdc($dc) }
+        $image.Save((Join-Path $Directory "$Name.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+        $left = 2
+        # Check populated ID, status (excluding icon), method, host and URL cells.
+        # Protocol is optional in HAR. Pale backgrounds and icons cannot pass.
+        for ($column = 0; $column -lt 6; $column++) {
+            $width = [JuanUiSmoke]::Send($List, 4125, [IntPtr]::new($column), [IntPtr]::Zero).ToInt32()
+            $right = [Math]::Min($left + $width - 3, $image.Width - 3)
+            if ($column -eq 1) { $right -= [Math]::Ceiling($width * 0.35) }
+            $red = 0
+            for ($x = $left + 2; $x -lt $right; $x++) {
+                for ($y = 2; $y -lt $image.Height - 2; $y++) {
+                    $pixel = $image.GetPixel($x, $y)
+                    # Match the actual foreground (178,48,65), not ClearType's
+                    # orange/red fringes around otherwise black native text.
+                    if ([Math]::Abs([int]$pixel.R - 178) -le 20 -and
+                        [Math]::Abs([int]$pixel.G - 48) -le 18 -and
+                        [Math]::Abs([int]$pixel.B - 65) -le 18) { $red++ }
+                }
+            }
+            if ($column -ne 3) {
+                Write-Output "$Name column $column red foreground pixels: $red"
+                if ($ExpectRed) {
+                    Assert-That ($red -ge 3) "$Name column $column has no red foreground glyphs; see native screenshot."
+                } else {
+                    Assert-That ($red -eq 0) "$Name column $column overrode native selection text with red."
+                }
+            }
+            $left += $width
+        }
+    } finally {
+        $graphics.Dispose()
+        $image.Dispose()
+    }
 }
 
 function Wait-Until([scriptblock]$Condition, [string]$Failure) {
@@ -184,6 +258,26 @@ function Wait-Modal([IntPtr]$Window, [string]$Title) {
     return [JuanUiSmoke]::GetLastActivePopup($Window)
 }
 
+function Click-ModalButton([IntPtr]$Window, [IntPtr]$Dialog, [int]$Id) {
+    $initial = [JuanUiSmoke]::GetDlgItem($Dialog, $Id)
+    Write-Output "Modal readiness: title='$(Get-ControlText $Dialog)' button=$Id exists=$($initial -ne [IntPtr]::Zero) visible=$([JuanUiSmoke]::IsWindowVisible($initial)) enabled=$([JuanUiSmoke]::IsWindowEnabled($initial))"
+    Write-Output ([JuanUiSmoke]::Describe($Dialog))
+    Wait-Until {
+        $button = [JuanUiSmoke]::GetDlgItem($Dialog, $Id)
+        if ($button -eq [IntPtr]::Zero -and $Id -eq 1) {
+            $button = [JuanUiSmoke]::FindButton($Dialog, 'OK')
+        }
+        $button -ne [IntPtr]::Zero -and [JuanUiSmoke]::IsWindowVisible($button) -and
+            [JuanUiSmoke]::IsWindowEnabled($button) -and -not [JuanUiSmoke]::IsWindowEnabled($Window)
+    } "Dialog button $Id did not become ready."
+    $button = [JuanUiSmoke]::GetDlgItem($Dialog, $Id)
+    if ($button -eq [IntPtr]::Zero -and $Id -eq 1) {
+        $button = [JuanUiSmoke]::FindButton($Dialog, 'OK')
+    }
+    Write-Output "Clicking actual dialog button id=$([JuanUiSmoke]::GetDlgCtrlID($button)) caption='$(Get-ControlText $button)'"
+    [void][JuanUiSmoke]::Send($button, 245, [IntPtr]::Zero, [IntPtr]::Zero)
+}
+
 function Choose-File([IntPtr]$Window, [string]$Title, [string]$Path) {
     $dialog = Wait-Modal $Window $Title
     Wait-Until {
@@ -194,8 +288,12 @@ function Choose-File([IntPtr]$Window, [string]$Title, [string]$Path) {
     $alternate = if ($preferred -eq 1001) { 1148 } else { 1001 }
     $filename = [JuanUiSmoke]::FindControlId($dialog, $preferred, 'Edit')
     if ($filename -eq [IntPtr]::Zero) { $filename = [JuanUiSmoke]::FindControlId($dialog, $alternate, 'Edit') }
-    Set-ControlText $filename $Path
-    Assert-That ((Get-ControlText $filename) -eq $Path) 'The file picker did not accept the explicit test output path.'
+    Wait-Until {
+        if (-not [JuanUiSmoke]::IsWindowVisible($filename) -or -not [JuanUiSmoke]::IsWindowEnabled($filename)) { return $false }
+        Set-ControlText $filename $Path
+        Start-Sleep -Milliseconds 100
+        (Get-ControlText $filename) -eq $Path
+    } 'The file picker did not accept the explicit test output path.'
     $button = [JuanUiSmoke]::FindControlId($dialog, 1, 'Button')
     Assert-That ($button -ne [IntPtr]::Zero) 'The file picker did not expose its confirmation button.'
     [void][JuanUiSmoke]::PostMessageW($button, 245, [IntPtr]::Zero, [IntPtr]::Zero)
@@ -265,12 +363,30 @@ function Invoke-LocalProxyProbe([int]$Port) {
 
 $before = Get-ProxySnapshot
 $trustBefore = Get-RootTrustSnapshot
-$profile = Join-Path ([System.IO.Path]::GetTempPath()) ("juan-ui-" + [guid]::NewGuid().ToString('N'))
+$profile = Join-Path (Join-Path $PSScriptRoot '..\target') ("juan-ui-" + [guid]::NewGuid().ToString('N'))
+$profile = [System.IO.Path]::GetFullPath($profile)
 [void][System.IO.Directory]::CreateDirectory($profile)
 $start = [System.Diagnostics.ProcessStartInfo]::new()
 $start.FileName = $Executable
 $fixture = (Join-Path $PSScriptRoot '..\tests\fixtures\fiddler-reference.saz')
-$start.Arguments = if ($Saz) { '"' + (Resolve-Path -LiteralPath $fixture).Path + '"' } else { '--demo' }
+if ($HarBom) { $Har = $true }
+if ($Har) { $fixture = Join-Path $PSScriptRoot '..\tests\fixtures\har\chrome.har' }
+if ($HarBom) { $fixture = Join-Path $PSScriptRoot '..\tests\fixtures\har\utf8-bom.har' }
+if ($Troubleshooting) { $fixture = Join-Path $PSScriptRoot '..\tests\fixtures\har\troubleshooting.har' }
+if ($RecentFiles) {
+    $recentFixtures = @()
+    foreach ($i in 0..6) {
+        $directory = Join-Path $profile "synthetic-$i"
+        [void][System.IO.Directory]::CreateDirectory($directory)
+        $destination = Join-Path $directory 'capture.har'
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\tests\fixtures\har\chrome.har') -Destination $destination
+        $recentFixtures += $destination
+    }
+    $sazFixture = Join-Path $profile 'capture.saz'
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\tests\fixtures\fiddler-reference.saz') -Destination $sazFixture
+    $fixture = $recentFixtures[0]
+}
+$start.Arguments = if ($Saz -or $Har -or $Troubleshooting -or $RecentFiles) { '"' + (Resolve-Path -LiteralPath $fixture).Path + '"' } else { '--demo' }
 $start.UseShellExecute = $false
 $start.WorkingDirectory = $profile
 $start.EnvironmentVariables['LOCALAPPDATA'] = $profile
@@ -288,6 +404,239 @@ try {
     $search = [JuanUiSmoke]::GetDlgItem($window, 108)
     $response = [JuanUiSmoke]::GetDlgItem($window, 115)
     Assert-That ($list -ne [IntPtr]::Zero) 'The native session list was not created.'
+    if ($RecentFiles) {
+        $historyFile = Join-Path $profile 'Juan\recent-files.json'
+        Wait-Until { (Test-Path -LiteralPath $historyFile) -and (Get-RowCount $list) -eq 1 } 'Startup HAR was not recorded after successful import.'
+        foreach ($path in @($recentFixtures[1..6]) + @($sazFixture)) {
+            [void][JuanUiSmoke]::PostMessageW($window,273,[IntPtr]::new(210),[IntPtr]::Zero)
+            Choose-File $window 'Open HAR or SAZ archive' $path
+            $confirm = Wait-Modal $window 'Replace retained sessions?'
+            Click-ModalButton $window $confirm 6
+            Wait-Until {
+                $saved = @(Get-Content -LiteralPath $historyFile -Raw | ConvertFrom-Json)
+                $saved.Count -gt 0 -and $saved[0].EndsWith($path, [StringComparison]::OrdinalIgnoreCase)
+            } 'Successful archive import was not persisted newest-first.'
+        }
+        $saved = @(Get-Content -LiteralPath $historyFile -Raw | ConvertFrom-Json)
+        Assert-That ($saved.Count -eq 5) 'Recent files did not enforce the five-entry cap.'
+        Assert-That ($saved[0].EndsWith('capture.saz')) 'SAZ was not recorded newest-first.'
+        $recentMenu = [JuanUiSmoke]::GetSubMenu([JuanUiSmoke]::GetSubMenu([JuanUiSmoke]::GetMenu($window),0),1)
+        Assert-That ([JuanUiSmoke]::GetMenuItemCount($recentMenu) -eq 7) 'Recent submenu should contain five paths, separator, and Clear history.'
+        $labels = @()
+        foreach ($i in 0..4) {
+            $label = [System.Text.StringBuilder]::new(32768)
+            [void][JuanUiSmoke]::GetMenuStringW($recentMenu,[uint32]$i,$label,$label.Capacity,1024)
+            $labels += $label.ToString()
+        }
+        Assert-That (($labels | Select-Object -Unique).Count -eq 5 -and $labels[1].Contains('synthetic-6')) 'Identical archive filenames were not disambiguated.'
+        # Close only the smoke-owned process, then reopen with the same isolated profile.
+        [void][JuanUiSmoke]::PostMessageW($window,16,[IntPtr]::Zero,[IntPtr]::Zero)
+        Assert-That ($process.WaitForExit(10000)) 'Synthetic instance did not close for persistence check.'
+        $process.Dispose()
+        $start.Arguments = ''
+        $process = [System.Diagnostics.Process]::Start($start)
+        Wait-Until { $process.Refresh(); $process.MainWindowHandle -ne [IntPtr]::Zero } 'Could not restart isolated recent-file smoke.'
+        $window = $process.MainWindowHandle
+        $list = [JuanUiSmoke]::GetDlgItem($window,110)
+        Invoke-CommandId $window 230
+        Wait-Until { (Get-RowCount $list) -eq 3 } 'Persisted SAZ did not reopen through the regular importer.'
+        Assert-That (@(Get-Content -LiteralPath $historyFile -Raw | ConvertFrom-Json).Count -eq 5) 'Reopening duplicated the recent path.'
+        Remove-Item -LiteralPath $sazFixture
+        [void][JuanUiSmoke]::PostMessageW($window,273,[IntPtr]::new(230),[IntPtr]::Zero)
+        $errorDialog = Wait-Modal $window 'Juan'
+        Click-ModalButton $window $errorDialog 1
+        Assert-That ((Get-RowCount $list) -eq 3) 'Missing recent file replaced retained sessions.'
+        $savedJson = Get-Content -LiteralPath $historyFile -Raw
+        Remove-Item -LiteralPath $historyFile
+        [void][System.IO.Directory]::CreateDirectory($historyFile)
+        [void][JuanUiSmoke]::PostMessageW($window,273,[IntPtr]::new(235),[IntPtr]::Zero)
+        $errorDialog = Wait-Modal $window 'Juan'
+        Click-ModalButton $window $errorDialog 1
+        Assert-That ((Get-RowCount $list) -eq 3) 'Failed history write changed retained sessions.'
+        Remove-Item -LiteralPath $historyFile
+        [System.IO.File]::WriteAllText($historyFile,$savedJson)
+        Invoke-CommandId $window 235
+        Wait-Until { @(Get-Content -LiteralPath $historyFile -Raw | ConvertFrom-Json).Count -eq 0 } 'Clear history was not persisted.'
+        Assert-That ((Get-RowCount $list) -eq 3) 'Clear history cleared captured sessions.'
+        Assert-That ((Get-ControlText ([JuanUiSmoke]::GetDlgItem($window,100))) -eq 'Start capture') 'Recent-file actions started capture.'
+        Write-Output 'Recent-files UI smoke passed: successful HAR/SAZ imports, five-entry cap, local disambiguated paths, restart/reopen, deduplication, missing-file preservation, visible write failure, persistent clear.'
+        return
+    }
+    if ($Troubleshooting) {
+        Wait-Until { (Get-RowCount $list) -eq 10 } 'Default asset hiding did not leave ten synthetic rows.'
+        $hide = [JuanUiSmoke]::GetDlgItem($window, 213)
+        $restore = [JuanUiSmoke]::GetDlgItem($window, 214)
+        $review = [JuanUiSmoke]::GetDlgItem($window, 215)
+        $url = [JuanUiSmoke]::GetDlgItem($window, 117)
+        $query = [JuanUiSmoke]::GetDlgItem($window, 217)
+        $findInfo = [JuanUiSmoke]::GetDlgItem($window, 222)
+        Assert-That ($restore -eq [IntPtr]::Zero) 'Redundant Restore assets control still exists.'
+        Assert-That ([JuanUiSmoke]::Send($hide, 240, [IntPtr]::Zero, [IntPtr]::Zero) -eq [IntPtr]::new(1)) 'Hide assets was not checked by default.'
+        Assert-That ((Get-ControlText $hide) -eq 'Hide assets (3 hidden)') 'Default hidden count is incorrect.'
+        [void][JuanUiSmoke]::Send($hide, 245, [IntPtr]::Zero, [IntPtr]::Zero)
+        Wait-Until { (Get-RowCount $list) -eq 13 } 'Unchecking Hide assets did not restore all synthetic rows.'
+        Assert-That ((Get-ControlText $hide) -eq 'Hide assets (0 hidden)') 'Unchecked count is incorrect.'
+        [void][JuanUiSmoke]::Send($hide, 245, [IntPtr]::Zero, [IntPtr]::Zero)
+        Wait-Until { (Get-RowCount $list) -eq 10 } 'Asset toggle did not hide exactly CSS/JS/image successes.'
+        Assert-That ((Get-ControlText $hide).Contains('3 hidden')) 'Hidden count is incorrect.'
+        $renderDirectory = Join-Path (Split-Path -Parent $Executable) 'synthetic-error-render'
+        [void][System.IO.Directory]::CreateDirectory($renderDirectory)
+        foreach ($probe in @(@('status:400','http400'), @('status:500','http500'), @('transport','transport'))) {
+            Set-ControlText $search $probe[0]
+            Wait-Until { (Get-RowCount $list) -eq 1 } 'Synthetic error probe did not isolate one row.'
+            Assert-RenderedErrorText $list $probe[1] $renderDirectory
+        }
+        Set-ControlText $search ''
+        Wait-Until { (Get-RowCount $list) -eq 10 } 'Could not restore synthetic rows after rendering checks.'
+        Assert-That ((Get-ControlText $review).Contains('6 visible')) 'Review counts should include errors only, not missing bodies.'
+        $scopeControl = [JuanUiSmoke]::GetDlgItem($window,109)
+        [void][JuanUiSmoke]::Send($scopeControl,334,[IntPtr]::new(4),[IntPtr]::Zero)
+        [void][JuanUiSmoke]::Send($window,273,[IntPtr]::new(65645),$scopeControl)
+        Wait-Until { (Get-RowCount $list) -eq 6 } 'JSON scope did not combine with asset hiding.'
+        Assert-That ((Get-ControlText $review).Contains('4 visible')) 'Review count ignored JSON scope.'
+        [void][JuanUiSmoke]::Send($scopeControl,334,[IntPtr]::Zero,[IntPtr]::Zero)
+        [void][JuanUiSmoke]::Send($window,273,[IntPtr]::new(65645),$scopeControl)
+        Wait-Until { (Get-RowCount $list) -eq 10 } 'All scope failed to restore non-assets.'
+        Invoke-CommandId $window 215
+        Wait-Until { (Get-ControlText $url).EndsWith('/transport') } 'Review did not prioritize recorded transport evidence.'
+        Invoke-CommandId $window 215
+        Wait-Until { (Get-ControlText $url).EndsWith('/server') } 'Review did not navigate next to 5xx.'
+        Assert-That ((Get-RowCount $list) -eq 10) 'Review navigation changed visibility.'
+        Set-ControlText $search 'status:400'
+        Wait-Until { (Get-RowCount $list) -eq 1 } 'HTTP 400 asset failure was incorrectly hidden.'
+        Invoke-CommandId $window 215
+        Wait-Until { (Get-ControlText $url).EndsWith('/bad-request.css') } 'Review skipped HTTP 400.'
+        Assert-RenderedErrorText $list 'http400-selected' $renderDirectory $false
+        $mainTabs = [JuanUiSmoke]::GetDlgItem($window,111)
+        [void][JuanUiSmoke]::Send($window,40,$mainTabs,[IntPtr]::new(1))
+        [void][JuanUiSmoke]::PostMessageW($mainTabs,256,[IntPtr]::new(39),[IntPtr]::Zero)
+        Wait-Until { (Get-ControlText ([JuanUiSmoke]::GetDlgItem($window,116))).Contains('400 Bad Request') } 'HTTP 400 detail explanation is missing.'
+        [void][JuanUiSmoke]::PostMessageW($mainTabs,256,[IntPtr]::new(37),[IntPtr]::Zero)
+        Wait-Until { [JuanUiSmoke]::Send($mainTabs,4875,[IntPtr]::Zero,[IntPtr]::Zero) -eq [IntPtr]::Zero } 'Could not restore inspectors tab.'
+        Set-ControlText $search 'status:403'
+        Wait-Until { (Get-RowCount $list) -eq 1 } 'Filter did not combine with hide assets.'
+        Assert-That ((Get-ControlText $review).Contains('1 visible')) 'Review did not disclose visible-scope count.'
+        Invoke-CommandId $window 215
+        Wait-Until { (Get-ControlText $url).EndsWith('/access') } 'Review failed within the current filter.'
+        [void][JuanUiSmoke]::Send($hide, 245, [IntPtr]::Zero, [IntPtr]::Zero)
+        Assert-That ((Get-RowCount $list) -eq 1) 'Unchecking Hide assets silently cleared other filters.'
+        [void][JuanUiSmoke]::Send($hide, 245, [IntPtr]::Zero, [IntPtr]::Zero)
+        Set-ControlText $search 'api.js'
+        Wait-Until { (Get-RowCount $list) -eq 1 } 'JSON API ending in .js was hidden.'
+        # Select the only row with the native keyboard path, preserving the owning UI thread's focus.
+        [void][JuanUiSmoke]::Send($window, 40, $list, [IntPtr]::new(1))
+        [void][JuanUiSmoke]::PostMessageW($list, 256, [IntPtr]::new(36), [IntPtr]::Zero)
+        Wait-Until { (Get-ControlText $response).Contains('Écho') } 'Could not select Unicode response.'
+        [void][JuanUiSmoke]::Send($window, 40, $response, [IntPtr]::new(1))
+        Invoke-CommandId $window 216
+        Set-ControlText $query 'écho'
+        Wait-Until { (Get-ControlText $findInfo).Contains('1 / 2') } 'Case-insensitive find did not match both Unicode occurrences.'
+        $display = Get-ControlText $response
+        $expected = $display.IndexOf('Écho', [StringComparison]::Ordinal)
+        $selection = [JuanUiSmoke]::Send($response, 176, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()
+        Assert-That (($selection -band 65535) -eq $expected) 'Native UTF-16 selection offset is incorrect after emoji.'
+        [void][JuanUiSmoke]::PostMessageW($query, 256, [IntPtr]::new(114), [IntPtr]::Zero)
+        Wait-Until { (Get-ControlText $findInfo).Contains('2 / 2') } 'F3 did not find the next occurrence.'
+        Invoke-CommandId $window 219
+        Wait-Until { (Get-ControlText $findInfo).Contains('wrapped') } 'Find did not report wrapping.'
+        $previous = [JuanUiSmoke]::GetDlgItem($window,220)
+        [void][JuanUiSmoke]::Send($window,40,$previous,[IntPtr]::new(1))
+        [void][JuanUiSmoke]::PostMessageW($previous,256,[IntPtr]::new(13),[IntPtr]::Zero)
+        try { Wait-Until { (Get-ControlText $findInfo).Contains('2 / 2 (wrapped)') } 'Enter on Previous did not search backward and wrap.' }
+        catch { throw "Enter on Previous failed. Actual: $(Get-ControlText $findInfo)" }
+        $next = [JuanUiSmoke]::GetDlgItem($window,219)
+        [void][JuanUiSmoke]::Send($window,40,$next,[IntPtr]::new(1))
+        [void][JuanUiSmoke]::PostMessageW($next,256,[IntPtr]::new(13),[IntPtr]::Zero)
+        Wait-Until { (Get-ControlText $findInfo).Contains('1 / 2 (wrapped)') } 'Enter on Next did not search forward.'
+        [void][JuanUiSmoke]::Send($window,40,$query,[IntPtr]::new(1))
+        [void][JuanUiSmoke]::Send([JuanUiSmoke]::GetDlgItem($window, 218), 245, [IntPtr]::Zero, [IntPtr]::Zero)
+        Wait-Until { (Get-ControlText $findInfo).Contains('Not found') } 'Match-case setting was not applied.'
+        Set-ControlText $query 'Écho'
+        Wait-Until { (Get-ControlText $findInfo).Contains('1 / 1') } 'Case-sensitive Unicode find failed.'
+        [void][JuanUiSmoke]::Send($window,40,$query,[IntPtr]::new(1))
+        [void][JuanUiSmoke]::PostMessageW($query, 256, [IntPtr]::new(13), [IntPtr]::Zero)
+        Wait-Until { (Get-ControlText $findInfo).Contains('wrapped') } 'Enter did not find next.'
+        $request = [JuanUiSmoke]::GetDlgItem($window,114)
+        [void][JuanUiSmoke]::Send($window,40,$request,[IntPtr]::new(1))
+        Wait-Until { (Get-ControlText $findInfo).StartsWith('Request preview selected') } 'Find did not follow request focus.'
+        Assert-That ([JuanUiSmoke]::Send($response,176,[IntPtr]::Zero,[IntPtr]::Zero) -eq [IntPtr]::Zero) 'Changing panes retained a stale response highlight.'
+        Set-ControlText $query 'HeaderNeedle'
+        Wait-Until { (Get-ControlText $findInfo).StartsWith('Request: 1 / 1') } 'Find did not search displayed request headers.'
+        $responseTabs = [JuanUiSmoke]::GetDlgItem($window,113)
+        [void][JuanUiSmoke]::Send($window,40,$responseTabs,[IntPtr]::new(1))
+        [void][JuanUiSmoke]::PostMessageW($responseTabs,256,[IntPtr]::new(37),[IntPtr]::Zero)
+        Wait-Until { [JuanUiSmoke]::Send($responseTabs,4875,[IntPtr]::Zero,[IntPtr]::Zero).ToInt32() -eq 1 } 'Could not switch response JSON to Text.'
+        Set-ControlText $query 'Écho'
+        Wait-Until { (Get-ControlText $findInfo).StartsWith('Response: 1 / 1') } 'Find did not follow the displayed response Text pane.'
+        [void][JuanUiSmoke]::PostMessageW($query, 256, [IntPtr]::new(27), [IntPtr]::Zero)
+        Wait-Until { -not [JuanUiSmoke]::IsWindowVisible($query) } 'Escape did not close message find.'
+        Invoke-CommandId $window 216
+        $closeFind = [JuanUiSmoke]::GetDlgItem($window,221)
+        [void][JuanUiSmoke]::Send($window,40,$closeFind,[IntPtr]::new(1))
+        [void][JuanUiSmoke]::PostMessageW($closeFind,256,[IntPtr]::new(13),[IntPtr]::Zero)
+        Wait-Until { -not [JuanUiSmoke]::IsWindowVisible($query) } 'Enter on Close searched instead of closing Find.'
+        Invoke-CommandId $window 216
+        Set-ControlText $search 'status:599'
+        Wait-Until { (Get-RowCount $list) -eq 0 } 'Could not clear selection through filtering.'
+        Invoke-CommandId $window 219
+        Assert-That ((Get-ControlText $findInfo).Contains('Select a session')) 'Find did not handle a filtered-away selection safely.'
+        Set-ControlText $search ''
+        Wait-Until { (Get-RowCount $list) -eq 10 } 'Clearing the filter changed the asset checkbox.'
+        [void][JuanUiSmoke]::Send($hide, 245, [IntPtr]::Zero, [IntPtr]::Zero)
+        Wait-Until { (Get-RowCount $list) -eq 13 } 'Unchecking Hide assets did not preserve all original sessions.'
+        Assert-That ((Get-ControlText ([JuanUiSmoke]::GetDlgItem($window,100))) -eq 'Start capture') 'Troubleshooting started capture.'
+        Write-Output 'Troubleshooting UI smoke passed: default assets checkbox/count, no Restore button, visible-scope review/navigation, Unicode message find/case/next/previous/wrap/Enter/Escape, filter switching, no capture.'
+        return
+    }
+    if ($Har) {
+        Wait-Until { (Get-RowCount $list) -eq 1 } 'The startup HAR did not load.'
+        Assert-That ((Get-ControlText $response).Contains('Not valid, complete JSON')) 'The plain-text HAR body did not reach the JSON inspector without double decompression.'
+        Assert-That ((Get-ControlText $response).Contains('HAR SOURCE')) 'HAR provenance is missing.'
+        Assert-That ((Get-ControlText ([JuanUiSmoke]::GetDlgItem($window, 100))) -eq 'Start capture') 'HAR import started capture.'
+        foreach ($id in 104, 105) {
+            Assert-That ([JuanUiSmoke]::Send([JuanUiSmoke]::GetDlgItem($window, $id), 240, [IntPtr]::Zero, [IntPtr]::Zero) -eq [IntPtr]::Zero) 'HAR import enabled routing or decryption.'
+        }
+        Set-ControlText $search 'type:text'
+        Wait-Until { (Get-RowCount $list) -eq 1 } 'HAR MIME fallback filtering failed.'
+        Set-ControlText $search ''
+        $output = Join-Path $profile 'exported.har'
+        [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(103), [IntPtr]::Zero)
+        $confirmation = Wait-Modal $window 'Export sanitized HAR?'
+        Click-ModalButton $window $confirmation 6
+        Choose-File $window 'Save visible sessions as HAR' $output
+        Wait-Until { Test-Path -LiteralPath $output } 'HAR export did not create a file.'
+        Wait-Until { [JuanUiSmoke]::IsWindowEnabled([JuanUiSmoke]::GetDlgItem($window, 103)) } 'HAR export did not finish.'
+        $cli = Join-Path (Split-Path -Parent $Executable) 'juan-cli.exe'
+        $rows = @(& $cli inspect $output | ForEach-Object { $_ | ConvertFrom-Json })
+        Assert-That ($LASTEXITCODE -eq 0 -and $rows.Count -eq 1) 'GUI-exported HAR failed read-back.'
+        Assert-That (-not ([System.IO.File]::ReadAllText($output).Contains('private-body'))) 'Sanitized HAR leaked a form value.'
+        [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(210), [IntPtr]::Zero)
+        $open = Wait-Modal $window 'Open HAR or SAZ archive'
+        [void][JuanUiSmoke]::PostMessageW($open, 273, [IntPtr]::new(2), [IntPtr]::Zero)
+        Wait-Until { [JuanUiSmoke]::GetLastActivePopup($window) -eq $window } 'Cancel open failed.'
+        Wait-Until { [JuanUiSmoke]::IsWindowEnabled($window) } 'File picker did not re-enable its owner.'
+        # Owner reactivation precedes return from the native file picker and command busy guard.
+        Start-Sleep -Milliseconds 250
+        Assert-That ((Get-RowCount $list) -eq 1) 'Cancelled open replaced existing HAR.'
+        [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(212), [IntPtr]::Zero)
+        $errorDialog = Wait-Modal $window 'Juan'
+        Click-ModalButton $window $errorDialog 1
+        Wait-Until { [JuanUiSmoke]::GetLastActivePopup($window) -eq $window } 'SAZ refusal did not dismiss.'
+        Assert-That ((Get-RowCount $list) -eq 1) 'SAZ refusal changed the capture.'
+        $invalid = Join-Path $profile 'invalid.har'
+        [System.IO.File]::WriteAllText($invalid, '{invalid')
+        [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(210), [IntPtr]::Zero)
+        Choose-File $window 'Open HAR or SAZ archive' $invalid
+        $confirm = Wait-Modal $window 'Replace retained sessions?'
+        Click-ModalButton $window $confirm 6
+        $errorDialog = Wait-Modal $window 'Juan'
+        Click-ModalButton $window $errorDialog 1
+        Wait-Until { [JuanUiSmoke]::GetLastActivePopup($window) -eq $window } 'Invalid HAR error did not dismiss.'
+        Assert-That ((Get-RowCount $list) -eq 1) 'Failed import replaced the previous capture.'
+        $process.Refresh()
+        Write-Output "HAR UI smoke passed: startup, decoded inspector, provenance, MIME filter, sanitized export/read-back, Open cancellation, SAZ refusal, failed import preservation. Working set: $([math]::Round($process.WorkingSet64 / 1MB, 1)) MiB."
+        return
+    }
     if ($Saz) {
         Wait-Until { (Get-RowCount $list) -eq 3 } 'The startup SAZ archive did not load its three synthetic sessions.'
         Assert-That ((Get-ControlText $response).Contains('Fiddler')) 'The imported JSON body did not appear in the inspector.'
@@ -297,6 +646,8 @@ try {
         }
         $output = Join-Path $profile 'exported.saz'
         [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(212), [IntPtr]::Zero)
+        $confirmation = Wait-Modal $window 'Export sanitized SAZ?'
+        Click-ModalButton $window $confirmation 6
         Choose-File $window 'Save visible sessions as SAZ' $output
         Wait-Until { Test-Path -LiteralPath $output } 'The native SAZ export did not create a file.'
         Wait-Until { [JuanUiSmoke]::IsWindowEnabled([JuanUiSmoke]::GetDlgItem($window, 103)) } 'The export completion was not acknowledged by the UI.'
@@ -308,14 +659,16 @@ try {
         [void][JuanUiSmoke]::Send([JuanUiSmoke]::GetDlgItem($warning, 7), 245, [IntPtr]::Zero, [IntPtr]::Zero)
         Wait-Until { [JuanUiSmoke]::GetLastActivePopup($window) -eq $window } 'Cancelling sensitive SAZ export did not dismiss the warning.'
         [void][JuanUiSmoke]::PostMessageW($window, 273, [IntPtr]::new(210), [IntPtr]::Zero)
-        $open = Wait-Modal $window 'Open Fiddler session archive'
+        $open = Wait-Modal $window 'Open HAR or SAZ archive'
         [void][JuanUiSmoke]::PostMessageW($open, 273, [IntPtr]::new(2), [IntPtr]::Zero)
         Wait-Until { [JuanUiSmoke]::GetLastActivePopup($window) -eq $window } 'Cancelling Open SAZ did not dismiss the dialog.'
         Assert-That ((Get-RowCount $list) -eq 3) 'Cancelling Open SAZ replaced the previous sessions.'
         Write-Output 'SAZ UI smoke passed: offline startup import, body inspector, native Save SAZ, read-back, sensitive export cancellation, and Open SAZ cancellation.'
         return
     }
-    Wait-Until { (Get-RowCount $list) -eq 12 } 'The native session list did not load the twelve demo sessions.'
+    # Hide assets is on by default: the CSS, JavaScript and PNG demo sessions are hidden.
+    Wait-Until { (Get-RowCount $list) -eq 9 } 'The native session list did not load the nine visible demo sessions.'
+    Assert-That ((Get-ControlText ([JuanUiSmoke]::GetDlgItem($window, 213))) -eq 'Hide assets (3 hidden)') 'Hide assets did not report the three hidden demo assets.'
     Assert-That ((Get-ControlText $response).Contains('Access token expired')) 'The selected response did not appear in the JSON inspector.'
     $process.Refresh()
     $idleMiB = [math]::Round($process.WorkingSet64 / 1MB, 1)
@@ -364,7 +717,7 @@ try {
     Set-ControlText $search 'status:700'
     Wait-Until { (Get-RowCount $list) -eq 0 } 'Invalid filters should not silently show unfiltered traffic.'
     Set-ControlText $search ''
-    Wait-Until { (Get-RowCount $list) -eq 12 } 'Clearing the filter did not restore the session list.'
+    Wait-Until { (Get-RowCount $list) -eq 9 } 'Clearing the filter did not restore the session list.'
 
     $reservation = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $reservation.Start()
@@ -377,7 +730,7 @@ try {
     Select-CaptureOption $setup 2
     Wait-Until { ([JuanUiSmoke]::GetLastActivePopup($window)) -eq $window } 'Cancelling capture setup did not dismiss the dialog.'
     Assert-That (-not (Test-Listening $port)) 'Cancelling capture setup left a listener running.'
-    Assert-That ((Get-RowCount $list) -eq 12) 'Cancelling capture setup cleared the existing sessions.'
+    Assert-That ((Get-RowCount $list) -eq 9) 'Cancelling capture setup cleared the existing sessions.'
     $setup = Open-CaptureSetup $window
     Select-CaptureOption $setup 1002
     Wait-Until { Test-Listening $port } 'The Start capture button did not start the listener.'
@@ -429,8 +782,8 @@ try {
     $ca = Join-Path $profile 'Juan\root-ca.dpapi'
     if (Test-Path -LiteralPath $ca) { Remove-Item -LiteralPath $ca }
     $dataDirectory = Join-Path $profile 'Juan'
-    if (Test-Path -LiteralPath $dataDirectory) { Remove-Item -LiteralPath $dataDirectory }
-    foreach ($name in 'exported.saz') {
+    if (Test-Path -LiteralPath $dataDirectory) { Remove-Item -LiteralPath $dataDirectory -Recurse -Force }
+    foreach ($name in 'exported.saz', 'exported.har', 'invalid.har') {
         $artifact = Join-Path $profile $name
         if (Test-Path -LiteralPath $artifact) { Remove-Item -LiteralPath $artifact }
     }
@@ -440,7 +793,7 @@ try {
         $directory = Join-Path $profile $relative
         if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory }
     }
-    Remove-Item -LiteralPath $profile
+    Remove-Item -LiteralPath $profile -Recurse -Force
     Assert-That ((Get-ProxySnapshot) -ceq $before) 'Windows proxy settings changed during the smoke test.'
     Assert-That ((Get-RootTrustSnapshot) -ceq $trustBefore) 'Windows certificate trust changed during the smoke test.'
 }

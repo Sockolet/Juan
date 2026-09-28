@@ -1,4 +1,8 @@
-param([switch]$SkipBuild)
+param(
+    [switch]$SkipBuild,
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]*$')]
+    [string]$PackageName
+)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -26,7 +30,8 @@ try {
     $metadata = cargo metadata --format-version 1 --locked --filter-platform x86_64-pc-windows-msvc --quiet | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'Could not read Cargo package metadata.' }
     $version = ($metadata.packages | Where-Object name -eq 'juan').version
-    $package = Join-Path $root "dist\juan-$version-windows-x64"
+    if (-not $PackageName) { $PackageName = "juan-$version-windows-x64" }
+    $package = Join-Path $root "dist\$PackageName"
     [void][System.IO.Directory]::CreateDirectory($package)
     foreach ($name in 'juan.exe', 'juan-cli.exe') {
         $source = Join-Path $metadata.target_directory "release\$name"

@@ -25,7 +25,7 @@ const HELP: &str = concat!(
 
 USAGE
   juan-cli capture [OPTIONS]
-  juan-cli inspect <input.saz> [--export <output.har|output.saz>] [--full]
+  juan-cli inspect <input.har|input.saz> [--export <output.har|output.saz>] [--full]
   juan-cli cert export <new-file.pem>
   juan-cli cert trust
   juan-cli cert remove
@@ -47,6 +47,8 @@ HTTP and HTTPS forwarding is streamed. Capture storage is bounded to 1,000
 sessions, 1 MB per body and 64 MB of total body bytes. Paused/evicted content is
 not recoverable. No traffic is written to disk unless you request an export.
 SAZ import/export supports unencrypted Stored/Deflate archives. The inspect
+command also reads HAR 1.2 (128 MiB input limit). HAR bodies are browser-exported
+representations, not wire capture. HAR-origin SAZ export is not supported. The inspect
 command is offline: it does not start a listener, recover proxy settings, or
 change certificate trust, and can run alongside the desktop.
 
@@ -276,7 +278,7 @@ fn inspect_archive(args: &[String]) -> Result<()> {
     }
     let input = PathBuf::from(
         args.first()
-            .context("inspect requires an input .saz filename")?,
+            .context("inspect requires an input .har or .saz filename")?,
     );
     let mut output = None;
     let mut mode = ExportMode::Sanitized;
@@ -296,9 +298,9 @@ fn inspect_archive(args: &[String]) -> Result<()> {
         mode != ExportMode::Full || output.is_some(),
         "--full requires --export"
     );
-    let imported = saz::load(&input, saz::Limits::default())?;
+    let imported = juan::archive::load(&input, saz::Limits::default())?;
     for warning in &imported.warnings {
-        eprintln!("SAZ: {warning}");
+        eprintln!("Archive: {warning}");
     }
     let store = CaptureStore::default();
     store.replace_from_archive(imported.sessions)?;
@@ -322,18 +324,26 @@ fn emit_sessions(store: &CaptureStore, printed: &mut BTreeSet<u64>) -> Result<()
     let mut stdout = io::stdout().lock();
     for session in snapshot.sessions {
         if session.complete && printed.insert(session.id) {
-            serde_json::to_writer(
-                &mut stdout,
-                &serde_json::json!({
-                    "id": session.id,
-                    "method": session.method,
-                    "url": session.url,
-                    "status": session.status,
-                    "bytes": session.bytes,
-                    "elapsedMs": session.elapsed_ms,
-                    "proxyError": session.failed,
-                }),
-            )?;
+            let mut row = serde_json::json!({
+                "id": session.id,
+                "method": session.method,
+                "url": session.url,
+                "status": session.status,
+                "bytes": session.bytes,
+                "elapsedMs": session.elapsed_ms,
+                "proxyError": session.failed,
+            });
+            if let Some(har) = &session.har {
+                row["har"] = serde_json::to_value(har)?;
+                row["elapsedMs"] = if har.time >= 0.0 {
+                    serde_json::json!(har.time)
+                } else {
+                    serde_json::Value::Null
+                };
+                row["proxyError"] = serde_json::json!(false);
+                row["sourceError"] = serde_json::json!(session.failed);
+            }
+            serde_json::to_writer(&mut stdout, &row)?;
             stdout.write_all(b"\n")?;
         }
     }

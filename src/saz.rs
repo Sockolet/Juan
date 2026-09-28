@@ -379,6 +379,7 @@ pub fn read<R: Read + Seek>(mut source: R, limits: Limits) -> Result<ImportedArc
             response: response.body,
             error: metadata.flags.get("x-juan-error").cloned(),
             archive: Some(ArchiveInfo {
+                har: None,
                 original_id: id,
                 bit_flags: metadata.bits,
                 flags: metadata.flags,
@@ -1043,6 +1044,12 @@ pub fn export(path: &Path, sessions: &[Session], mode: ExportMode) -> Result<()>
 }
 
 pub fn write<W: Write + Seek>(output: W, sessions: &[Session], mode: ExportMode) -> Result<()> {
+    ensure!(
+        sessions
+            .iter()
+            .all(|s| s.archive.as_ref().is_none_or(|a| a.har.is_none())),
+        "HAR-origin sessions cannot be exported to SAZ; HAR-to-SAZ conversion is deferred. Save HAR instead."
+    );
     ensure!(!sessions.is_empty(), "There are no sessions to export");
     ensure!(
         sessions.len() <= 1000,

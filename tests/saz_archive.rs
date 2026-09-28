@@ -49,6 +49,42 @@ fn minimal(extra: Option<(&str, &[u8])>) -> Vec<u8> {
     }
     archive(&entries)
 }
+#[test]
+fn renamed_saz_uses_the_same_bounded_loader() {
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    for name in ["capture.zip", "capture", "capture.unknown"] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, minimal(None)).unwrap();
+        let imported = juan::archive::load(&path, Limits::default()).unwrap();
+        assert_eq!(imported.sessions.len(), 1);
+        assert_eq!(imported.sessions[0].response.data, b"hello");
+        std::fs::write(&path, b"not a ZIP archive").unwrap();
+        assert!(juan::archive::load(&path, Limits::default()).is_err());
+    }
+}
+
+#[test]
+fn renamed_har_is_detected_by_content_and_saz_extension_is_never_sniffed() {
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let har = include_bytes!("fixtures/har/chrome.har");
+    for name in ["capture.json", "capture", "capture.txt"] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, har).unwrap();
+        assert!(
+            !juan::archive::load(&path, Limits::default())
+                .unwrap()
+                .sessions
+                .is_empty()
+        );
+    }
+    let path = dir.path().join("bom.json");
+    std::fs::write(&path, include_bytes!("fixtures/har/utf8-bom.har")).unwrap();
+    assert!(juan::archive::load(&path, Limits::default()).is_ok());
+    let path = dir.path().join("capture.saz");
+    std::fs::write(&path, har).unwrap();
+    let error = juan::archive::load(&path, Limits::default()).unwrap_err();
+    assert!(format!("{error:#}").contains("ZIP"));
+}
 
 fn encode(sessions: &[juan::capture::Session], mode: ExportMode) -> Vec<u8> {
     let mut output = Cursor::new(Vec::new());

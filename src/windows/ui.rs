@@ -14,7 +14,11 @@ use windows_sys::Win32::{
     Graphics::{Dwm::*, Gdi::*},
     System::{LibraryLoader::GetModuleHandleW, SystemServices::SS_CENTER},
     UI::{
-        Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::ShellExecuteW,
+        Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
+        Controls::*,
+        HiDpi::*,
+        Input::KeyboardAndMouse::*,
+        Shell::ShellExecuteW,
         WindowsAndMessaging::*,
     },
 };
@@ -32,7 +36,7 @@ use crate::{
     har::ExportMode,
     inspect::{self, Inspector},
     proxy::{self, ProxyConfig, ProxyHandle},
-    saz,
+    saz, troubleshoot,
 };
 
 const CAPTURE: u16 = 100;
@@ -67,6 +71,18 @@ const FOCUS_SEARCH: u16 = 209;
 const IMPORT_SAZ: u16 = 210;
 const EXPORT_SAZ: u16 = 211;
 const EXPORT_SAZ_SANITIZED: u16 = 212;
+const HIDE_ASSETS: u16 = 213;
+const RECENT_FIRST: u16 = 230;
+const RECENT_LAST: u16 = 234;
+const CLEAR_RECENT: u16 = 235;
+const REVIEW_FIRST: u16 = 215;
+const FIND: u16 = 216;
+const FIND_QUERY: u16 = 217;
+const FIND_CASE: u16 = 218;
+const FIND_NEXT: u16 = 219;
+const FIND_PREVIOUS: u16 = 220;
+const FIND_CLOSE: u16 = 221;
+const FIND_INFO: u16 = 222;
 const CAPTURE_WINDOWS: i32 = 1001;
 const CAPTURE_MANUAL: i32 = 1002;
 const HTTPS_TRUST_WINDOWS: i32 = 1101;
@@ -86,7 +102,7 @@ enum HttpsTrust {
 
 const COLUMNS: [(&str, i32); 9] = [
     ("#", 42),
-    ("Result", 58),
+    ("Result", 88),
     ("Method", 76),
     ("Protocol", 70),
     ("Host", 166),
@@ -97,6 +113,14 @@ const COLUMNS: [(&str, i32); 9] = [
 ];
 
 struct Controls {
+    hide_assets: HWND,
+    review: HWND,
+    find_query: HWND,
+    find_case: HWND,
+    find_next: HWND,
+    find_previous: HWND,
+    find_close: HWND,
+    find_info: HWND,
     capture: HWND,
     stop: HWND,
     clear: HWND,
@@ -120,8 +144,16 @@ struct Controls {
 }
 
 impl Controls {
-    fn all(&self) -> [HWND; 20] {
+    fn all(&self) -> [HWND; 28] {
         [
+            self.hide_assets,
+            self.review,
+            self.find_query,
+            self.find_case,
+            self.find_next,
+            self.find_previous,
+            self.find_close,
+            self.find_info,
             self.capture,
             self.stop,
             self.clear,
@@ -152,6 +184,14 @@ type ImportResult = std::result::Result<(PathBuf, saz::ImportedArchive), String>
 // Shared references plus narrowly scoped interior borrows allow Win32's synchronous reentrancy.
 // No mutable App reference is ever created from window user data.
 struct App {
+    high_contrast: Cell<bool>,
+    high_contrast_error: Cell<bool>,
+    hide_assets: Cell<bool>,
+    excluded: Cell<troubleshoot::Excluded>,
+    review_cursor: Cell<Option<u64>>,
+    find_open: Cell<bool>,
+    find_target: Cell<usize>,
+    find_cursor: Cell<Option<(usize, usize)>>,
     hwnd: Cell<HWND>,
     dpi: Cell<u32>,
     controls: OnceCell<Controls>,
@@ -190,6 +230,8 @@ struct App {
     import: RefCell<Option<mpsc::Receiver<ImportResult>>>,
     archive_name: RefCell<Option<String>>,
     initialization_error: RefCell<Option<String>>,
+    recent: RefCell<super::recent::RecentFiles>,
+    recent_warning: RefCell<Option<String>>,
 }
 
 impl App {
@@ -203,7 +245,25 @@ impl App {
         if demo {
             demo::populate(&store);
         }
+        let directory = system::data_directory()?;
+        let (recent, recent_warning) = match super::recent::RecentFiles::load(&directory) {
+            Ok(history) => (history, None),
+            Err(error) => (
+                super::recent::RecentFiles::empty(&directory),
+                Some(format!(
+                    "Recent-file history could not be loaded: {error:#}"
+                )),
+            ),
+        };
         Ok(Self {
+            high_contrast: Cell::new(true),
+            high_contrast_error: Cell::new(false),
+            hide_assets: Cell::new(troubleshoot::HIDE_ASSETS_DEFAULT),
+            excluded: Cell::new(troubleshoot::Excluded::default()),
+            review_cursor: Cell::new(None),
+            find_open: Cell::new(false),
+            find_target: Cell::new(1),
+            find_cursor: Cell::new(None),
             hwnd: Cell::new(null_mut()),
             dpi: Cell::new(dpi),
             controls: OnceCell::new(),
@@ -250,6 +310,8 @@ impl App {
             import: RefCell::new(None),
             archive_name: RefCell::new(None),
             initialization_error: RefCell::new(None),
+            recent: RefCell::new(recent),
+            recent_warning: RefCell::new(recent_warning),
         })
     }
 
@@ -257,7 +319,35 @@ impl App {
         scaled(value, self.dpi.get())
     }
 
+    fn refresh_high_contrast(&self) {
+        let mut contrast = HIGHCONTRASTW {
+            cbSize: size_of::<HIGHCONTRASTW>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: contrast has the required size and is writable for the synchronous call.
+        let success = unsafe {
+            SystemParametersInfoW(
+                SPI_GETHIGHCONTRAST,
+                contrast.cbSize,
+                (&mut contrast as *mut HIGHCONTRASTW).cast(),
+                0,
+            )
+        };
+        self.high_contrast
+            .set(high_contrast_enabled(success != 0, contrast.dwFlags));
+        // WM_SETTINGCHANGE is frequent; report only the first failure of a failing streak.
+        if success == 0 && !self.high_contrast_error.replace(true) {
+            self.store.notice(format!(
+                "Could not query high contrast; using system list colors: {}",
+                std::io::Error::last_os_error()
+            ));
+        } else if success != 0 {
+            self.high_contrast_error.set(false);
+        }
+    }
+
     fn initialize(&self) -> Result<()> {
+        self.refresh_high_contrast();
         let parent = self.hwnd.get();
         let button = |text, id| {
             child(
@@ -289,6 +379,7 @@ impl App {
                     | WS_HSCROLL
                     | ES_MULTILINE as u32
                     | ES_READONLY as u32
+                    | ES_NOHIDESEL as u32
                     | ES_AUTOVSCROLL as u32
                     | ES_AUTOHSCROLL as u32,
                 0,
@@ -297,6 +388,49 @@ impl App {
         };
         let tabs = |id| child(parent, "SysTabControl32", "", WS_TABSTOP, 0, id);
         let controls = Controls {
+            hide_assets: checkbox("Hide assets", HIDE_ASSETS)?,
+            review: button("Review first (0 visible)", REVIEW_FIRST)?,
+            find_query: child(
+                parent,
+                "EDIT",
+                "",
+                WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32,
+                0,
+                FIND_QUERY,
+            )?,
+            find_case: checkbox("Match case", FIND_CASE)?,
+            find_next: child(
+                parent,
+                "BUTTON",
+                "Next",
+                WS_TABSTOP | BS_PUSHBUTTON as u32,
+                0,
+                FIND_NEXT,
+            )?,
+            find_previous: child(
+                parent,
+                "BUTTON",
+                "Previous",
+                WS_TABSTOP | BS_PUSHBUTTON as u32,
+                0,
+                FIND_PREVIOUS,
+            )?,
+            find_close: child(
+                parent,
+                "BUTTON",
+                "Close",
+                WS_TABSTOP | BS_PUSHBUTTON as u32,
+                0,
+                FIND_CLOSE,
+            )?,
+            find_info: child(
+                parent,
+                "STATIC",
+                "Find in displayed preview only",
+                0,
+                0,
+                FIND_INFO,
+            )?,
             capture: button("Start capture", CAPTURE)?,
             stop: button("Stop", STOP)?,
             clear: button("Clear", CLEAR)?,
@@ -402,6 +536,7 @@ impl App {
                     wide(value).as_ptr() as isize,
                 );
             }
+            set_checked(controls.hide_assets, self.hide_assets.get());
             SendMessageW(controls.scope, CB_SETCURSEL, 0, 0);
             SendMessageW(
                 controls.search,
@@ -410,6 +545,13 @@ impl App {
                 wide("Search traffic...  host:api  status:4xx").as_ptr() as isize,
             );
             SendMessageW(controls.search, EM_SETLIMITTEXT, 2048, 0);
+            SendMessageW(controls.find_query, EM_SETLIMITTEXT, 256, 0);
+            SendMessageW(
+                controls.find_query,
+                EM_SETCUEBANNER,
+                1,
+                wide("Find in message (Ctrl+F)").as_ptr() as isize,
+            );
             SendMessageW(controls.port, EM_SETLIMITTEXT, 5, 0);
             for editor in [controls.request, controls.response, controls.detail] {
                 SendMessageW(editor, EM_SETLIMITTEXT, 4 * 1024 * 1024, 0);
@@ -510,7 +652,20 @@ impl App {
         position(c.autoscroll, width - s(126), s(84), s(114), s(32));
         position(c.search, s(16), s(151), split - s(174), s(29));
         position(c.scope, split - s(150), s(150), s(138), s(240));
-        position(c.list, s(16), s(194), split - s(27), height - s(237));
+        position(c.hide_assets, s(16), s(183), s(220), s(26));
+        if split >= s(460) {
+            position(c.review, s(242), s(183), split - s(253), s(29));
+        } else {
+            position(c.review, s(16), s(213), split - s(27), s(29));
+        }
+        let list_top = list_top(split >= s(460));
+        position(
+            c.list,
+            s(16),
+            s(list_top),
+            split - s(27),
+            height - s(list_top + 43),
+        );
         position(
             c.main_tabs,
             split + s(14),
@@ -521,11 +676,30 @@ impl App {
         position(c.url, split + s(22), s(198), width - split - s(142), s(27));
         position(c.copy, width - s(112), s(195), s(90), s(29));
         let right = width - split - s(44);
-        let body_top = s(286);
+        let find_height = if self.find_open.get() { s(80) } else { 0 };
+        let body_top = s(286) + find_height;
         let available = (height - body_top - s(109)).max(s(100));
         let request_height = (available as f64 * 0.43) as i32;
         let response_label = body_top + request_height + s(15);
-        position(c.request_tabs, split + s(16), s(252), right + s(12), s(30));
+        position(
+            c.request_tabs,
+            split + s(16),
+            s(252) + find_height,
+            right + s(12),
+            s(30),
+        );
+        position(
+            c.find_query,
+            split + s(22),
+            s(230),
+            (right - s(220)).max(s(50)),
+            s(26),
+        );
+        position(c.find_previous, width - s(233), s(230), s(78), s(26));
+        position(c.find_next, width - s(151), s(230), s(58), s(26));
+        position(c.find_close, width - s(89), s(230), s(64), s(26));
+        position(c.find_case, split + s(22), s(260), s(110), s(22));
+        position(c.find_info, split + s(22), s(285), right, s(22));
         position(c.request, split + s(21), body_top, right, request_height);
         position(
             c.response_tabs,
@@ -543,6 +717,16 @@ impl App {
         );
         position(c.detail, split + s(21), s(238), right, height - s(282));
         let inspectors = self.main_tab.get() == 0;
+        for handle in [
+            c.find_query,
+            c.find_case,
+            c.find_next,
+            c.find_previous,
+            c.find_close,
+            c.find_info,
+        ] {
+            visible(handle, inspectors && self.find_open.get());
+        }
         for handle in [c.request_tabs, c.response_tabs, c.request, c.response] {
             visible(handle, inspectors);
         }
@@ -579,7 +763,7 @@ impl App {
         set_checked(c.https, self.decrypt.get());
         set_checked(c.system_proxy, self.routed.get());
         let title = if let Some(name) = self.archive_name.borrow().as_ref() {
-            format!("Juan - {name} (SAZ archive)")
+            format!("Juan - {name} (archive)")
         } else if self.demo.get() {
             "Juan - Demo data (no traffic intercepted)".to_owned()
         } else {
@@ -594,6 +778,29 @@ impl App {
         unsafe {
             InvalidateRect(self.hwnd.get(), null(), 0);
         }
+    }
+
+    fn refresh_recent_menu(&self) -> Result<()> {
+        let history = make_recent_menu(&self.recent.borrow())?;
+        // SAFETY: The live window owns File and its old submenu. The new submenu
+        // transfers ownership only after SetMenuItemInfoW succeeds.
+        unsafe {
+            let file = GetSubMenu(GetMenu(self.hwnd.get()), 0);
+            let old = GetSubMenu(file, 1);
+            let info = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_SUBMENU,
+                hSubMenu: history,
+                ..Default::default()
+            };
+            if SetMenuItemInfoW(file, 1, 1, &info) == 0 {
+                DestroyMenu(history);
+                bail!("Update recent-file menu");
+            }
+            DestroyMenu(old);
+            DrawMenuBar(self.hwnd.get());
+        }
+        Ok(())
     }
 
     fn report(&self, error: anyhow::Error) {
@@ -627,6 +834,69 @@ impl App {
             return Ok(());
         };
         match id {
+            RECENT_FIRST..=RECENT_LAST => {
+                let path = self
+                    .recent
+                    .borrow()
+                    .paths()
+                    .get((id - RECENT_FIRST) as usize)
+                    .cloned()
+                    .context("Recent-file entry is no longer available")?;
+                let path = super::recent::local_archive_path(&path)?;
+                self.begin_import(path, true)?;
+            }
+            CLEAR_RECENT => {
+                ensure!(
+                    self.import.borrow().is_none(),
+                    "Wait for the archive import before clearing recent files"
+                );
+                self.recent
+                    .borrow_mut()
+                    .clear()
+                    .context("Clear recent-file history")?;
+                self.refresh_recent_menu()?;
+                self.set_status("Recent-file history cleared. Archive files and retained sessions are unchanged.");
+            }
+            HIDE_ASSETS => {
+                self.hide_assets.set(checked(c.hide_assets));
+                self.review_cursor.set(None);
+                self.refresh(true);
+            }
+            REVIEW_FIRST => {
+                let order = troubleshoot::review_order(&self.rows.borrow());
+                if !order.is_empty() {
+                    let index = self
+                        .review_cursor
+                        .get()
+                        .and_then(|id| order.iter().position(|v| *v == id))
+                        .map_or(0, |i| (i + 1) % order.len());
+                    let id = order[index];
+                    self.review_cursor.set(Some(id));
+                    self.selected.set(Some(id));
+                    self.refresh(true);
+                    self.render_details(true);
+                    let row = self.rows.borrow().iter().position(|r| r.id == id);
+                    if let Some(row) = row {
+                        // SAFETY: Scroll the selected visible row without changing the sort or filters.
+                        unsafe {
+                            SendMessageW(c.list, LVM_ENSUREVISIBLE, row, 0);
+                        }
+                    }
+                    self.set_status(format!("Review {} of {} visible candidates; evidence, not a diagnosis. Order and filters unchanged.", index + 1, order.len()));
+                }
+            }
+            FIND => self.open_find(),
+            FIND_NEXT | FIND_PREVIOUS => {
+                if !self.find_open.get() || self.main_tab.get() != 0 {
+                    self.open_find();
+                }
+                self.find_step(id == FIND_PREVIOUS);
+            }
+            FIND_CASE => {
+                self.find_cursor.set(None);
+                self.find_step(false);
+            }
+            FIND_CLOSE => self.close_find(),
             CAPTURE => {
                 ensure!(
                     self.import.borrow().is_none(),
@@ -1109,6 +1379,11 @@ impl App {
             self.export.borrow().is_none(),
             "An archive export is already running"
         );
+        ensure!(
+            self.filter_error.borrow().is_none(),
+            "Correct the invalid filter before exporting"
+        );
+        // Export exactly the displayed rows, in display order, with the counts computed with them.
         let ids: Vec<_> = self.rows.borrow().iter().map(|row| row.id).collect();
         ensure!(!ids.is_empty(), "There are no visible sessions to export");
         let sessions = self.store.sessions(&ids);
@@ -1116,17 +1391,35 @@ impl App {
             sessions.len() == ids.len(),
             "Some visible sessions were evicted before the export snapshot. Pause capture, refresh the view, and export again."
         );
-        if mode == ExportMode::Full
-            && !confirm(
-                self.hwnd.get(),
-                &format!("Export sensitive full {}?", format.name()),
-                &format!(
-                    "A full {} includes retained request/response bodies, authorization headers, cookies, and URLs. It may contain passwords, personal information, and active credentials.\n\n\
-             Save only to an authorized location and review before sharing. Prefer the default sanitized export when bodies are not needed.\n\nContinue?",
-                    format.name()
-                ),
+        let counts = self.excluded.get().counts_message(sessions.len());
+        ensure!(
+            format != Format::Saz
+                || sessions
+                    .iter()
+                    .all(|s| s.archive.as_ref().is_none_or(|a| a.har.is_none())),
+            "HAR-origin sessions cannot be exported to SAZ; HAR-to-SAZ conversion is deferred. Save HAR instead."
+        );
+        let warning = if mode == ExportMode::Full {
+            format!(
+                "A full {} includes retained request/response bodies, authorization headers, cookies, and URLs. It may contain passwords, personal information, and active credentials.\n\nSave only to an authorized location and review before sharing. Prefer sanitized export when bodies are not needed.",
+                format.name()
             )
-        {
+        } else {
+            "Sanitized export omits bodies and redacts common secrets. It is not anonymized; review URLs and custom headers before sharing.".to_owned()
+        };
+        if !confirm(
+            self.hwnd.get(),
+            &format!(
+                "Export {} {}?",
+                if mode == ExportMode::Full {
+                    "sensitive full"
+                } else {
+                    "sanitized"
+                },
+                format.name()
+            ),
+            &format!("{counts}\n\n{warning}\n\nContinue?"),
+        ) {
             return Ok(());
         }
         let now = time::OffsetDateTime::now_utc();
@@ -1174,7 +1467,7 @@ impl App {
     fn begin_import(&self, path: PathBuf, confirm_replace: bool) -> Result<()> {
         ensure!(
             !self.active.get(),
-            "Stop the proxy before opening a SAZ archive"
+            "Stop the proxy before opening an archive"
         );
         ensure!(
             self.import.borrow().is_none() && self.export.borrow().is_none(),
@@ -1186,7 +1479,7 @@ impl App {
             && !confirm(
                 self.hwnd.get(),
                 "Replace retained sessions?",
-                "Opening a SAZ replaces the sessions currently in memory after the archive has been parsed successfully. Export any evidence you need first.\n\nNo proxy routing or certificate trust will be changed. Continue?",
+                "Opening an archive replaces the sessions currently in memory after the archive has been parsed successfully. Export any evidence you need first.\n\nNo proxy routing or certificate trust will be changed. Continue?",
             )
         {
             return Ok(());
@@ -1197,19 +1490,19 @@ impl App {
         };
         let (sender, receiver) = mpsc::channel();
         std::thread::Builder::new()
-            .name("juan-saz-import".into())
+            .name("juan-archive-import".into())
             .spawn(move || {
-                let result = saz::load(&path, limits)
+                let result = crate::archive::load(&path, limits)
                     .map(|archive| (path, archive))
                     .map_err(|error| format!("{error:#}"));
                 if sender.send(result).is_err() {
-                    eprintln!("SAZ import completed after its UI receiver closed.");
+                    eprintln!("Archive import completed after its UI receiver closed.");
                 }
             })
-            .context("Start SAZ import worker")?;
+            .context("Start archive import worker")?;
         *self.import.borrow_mut() = Some(receiver);
         self.set_status(
-            "Reading SAZ archive... Existing sessions are unchanged until import succeeds.",
+            "Reading archive... Existing sessions are unchanged until import succeeds.",
         );
         self.update_toolbar();
         Ok(())
@@ -1238,9 +1531,11 @@ impl App {
                 .map(|session| session.id),
         );
         *self.filter.borrow_mut() = Filter::default();
+        self.review_cursor.set(None);
         self.filter_error.borrow_mut().take();
         self.scope.set(0);
         if let Some(c) = self.controls.get() {
+            set_checked(c.hide_assets, self.hide_assets.get());
             // SAFETY: The selection change targets our live native combo box and retains no pointers.
             unsafe {
                 SendMessageW(c.scope, CB_SETCURSEL, 0, 0);
@@ -1248,12 +1543,24 @@ impl App {
             set_text(c.search, "");
         }
         self.store.notice(format!(
-            "Opened {count} sessions from a SAZ archive without starting the proxy."
+            "Opened {count} sessions from an archive without starting the proxy."
         ));
         for warning in archive.warnings {
             self.store.notice(warning);
         }
-        self.set_status(format!("Opened {count} SAZ sessions; {warnings} archive notes. See Timing and Diagnostics for fidelity details."));
+        self.set_status(format!("Opened {count} archive sessions; {warnings} archive notes. See Timing and Diagnostics for fidelity details."));
+        let recorded = self.recent.borrow_mut().record_success(&path);
+        match recorded {
+            Err(error) => self.report(error.context(
+                "Archive opened successfully, but recent-file history could not be saved",
+            )),
+            Ok(false) => self.set_status(format!(
+                "Opened {count} archive sessions; {warnings} archive notes. Recent history skipped: only local HAR/SAZ paths are supported."
+            )),
+            Ok(true) => if let Err(error) = self.refresh_recent_menu() {
+                self.report(error);
+            },
+        }
         self.refresh(true);
         self.render_details(true);
         Ok(())
@@ -1284,7 +1591,7 @@ impl App {
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 self.import.borrow_mut().take();
                 self.report(anyhow::anyhow!(
-                    "The SAZ import worker stopped without returning a result"
+                    "The archive import worker stopped without returning a result"
                 ));
             }
             _ => {}
@@ -1348,26 +1655,31 @@ impl App {
             .filter(|row| row.is_error())
             .count();
         let old_count = self.rows.borrow().len();
-        let mut rows: Vec<_> = if self.filter_error.borrow().is_some() {
-            Vec::new()
+        let view = if self.filter_error.borrow().is_some() {
+            troubleshoot::ViewSnapshot {
+                rows: Vec::new(),
+                excluded: troubleshoot::Excluded {
+                    asset_hidden: 0,
+                    other_excluded: total,
+                },
+            }
         } else {
-            let filter = self.filter.borrow();
-            snapshot
-                .sessions
-                .into_iter()
-                .filter(|row| {
-                    filter.matches(row)
-                        && match self.scope.get() {
-                            1 => !row.is_https(),
-                            2 => row.is_https(),
-                            3 => row.is_error(),
-                            4 => row.content_type.contains("json"),
-                            5 => row.kind != SessionKind::Tunnel,
-                            _ => true,
-                        }
-                })
-                .collect()
+            troubleshoot::view_snapshot(
+                snapshot.sessions,
+                &self.filter.borrow(),
+                self.scope.get(),
+                self.hide_assets.get(),
+            )
         };
+        self.excluded.set(view.excluded);
+        let mut rows = view.rows;
+        set_text(
+            c.hide_assets,
+            &format!("Hide assets ({} hidden)", view.excluded.asset_hidden),
+        );
+        let order = troubleshoot::review_order(&rows);
+        set_text(c.review, &format!("Review first ({} visible)", order.len()));
+        enable(c.review, !order.is_empty());
         let (column, ascending) = self.sort.get();
         rows.sort_by(|a, b| {
             let order = compare_rows(a, b, column).then_with(|| a.id.cmp(&b.id));
@@ -1452,7 +1764,11 @@ impl App {
                 String::new()
             };
             let detail = if self.main_tab.get() == 1 {
-                inspect::render_timing(&session)
+                format!(
+                    "STATUS: {}\r\nRed/marker indicates recorded status or failure, not a root-cause diagnosis.\r\n\r\n{}",
+                    troubleshoot::reason(&session.summary()),
+                    inspect::render_timing(&session)
+                )
             } else {
                 inspect::render_notices(&self.store.notices())
             };
@@ -1463,9 +1779,7 @@ impl App {
             );
             let response_info = format!(
                 "{}  /  {}  /  {}",
-                session
-                    .status
-                    .map_or(String::from("Pending"), |s| s.to_string()),
+                troubleshoot::reason(&session.summary()),
                 inspect::bytes_label(session.response.total_bytes),
                 session
                     .elapsed_ms()
@@ -1513,6 +1827,13 @@ impl App {
                 }
             }
             self.viewer_text.borrow_mut()[index] = value;
+            if self.find_open.get() && index == self.find_target.get() {
+                self.find_cursor.set(None);
+                set_text(
+                    c.find_info,
+                    "Preview changed; Next searches the current displayed text only.",
+                );
+            }
         }
         enable(c.copy, self.selected.get().is_some());
         // SAFETY: Chrome includes the selected request and response byte counters.
@@ -1522,6 +1843,7 @@ impl App {
     }
 
     fn filter_changed(&self) {
+        self.review_cursor.set(None);
         let Some(c) = self.controls.get() else { return };
         match Filter::parse(&text(c.search)) {
             Ok(filter) => {
@@ -1534,7 +1856,197 @@ impl App {
         }
         self.refresh(true);
     }
+    fn select_find_pane(&self, target: usize) {
+        let previous = self.find_target.replace(target);
+        if previous == target {
+            return;
+        }
+        self.find_cursor.set(None);
+        if self.find_open.get()
+            && let Some(c) = self.controls.get()
+        {
+            // SAFETY: A pane change invalidates the old inspector's search selection.
+            unsafe {
+                SendMessageW(
+                    if previous == 0 { c.request } else { c.response },
+                    EM_SETSEL,
+                    0,
+                    0,
+                );
+            }
+            set_text(
+                c.find_info,
+                if target == 0 {
+                    "Request preview selected; Next searches displayed text only."
+                } else {
+                    "Response preview selected; Next searches displayed text only."
+                },
+            );
+        }
+    }
 
+    fn open_find(&self) {
+        let Some(c) = self.controls.get() else { return };
+        // SAFETY: Read focus from this UI thread and focus our own query edit.
+        unsafe {
+            let focus = GetFocus();
+            if focus == c.request || focus == c.request_tabs {
+                self.select_find_pane(0);
+            }
+            if focus == c.response || focus == c.response_tabs {
+                self.select_find_pane(1);
+            }
+            self.main_tab.set(0);
+            SendMessageW(c.main_tabs, TCM_SETCURSEL, 0, 0);
+            self.find_open.set(true);
+            self.find_cursor.set(None);
+            self.layout();
+            self.render_details(false);
+            set_text(
+                c.find_info,
+                "Find in displayed preview only; Ctrl+L filters sessions.",
+            );
+            SetFocus(c.find_query);
+            SendMessageW(c.find_query, EM_SETSEL, 0, -1);
+        }
+    }
+
+    fn close_find(&self) {
+        let Some(c) = self.controls.get() else { return };
+        self.find_open.set(false);
+        self.find_cursor.set(None);
+        self.layout();
+        // SAFETY: Restore focus to the remembered live inspector control.
+        unsafe {
+            SetFocus(if self.find_target.get() == 0 {
+                c.request
+            } else {
+                c.response
+            });
+        }
+    }
+
+    fn find_step(&self, backwards: bool) {
+        let Some(c) = self.controls.get() else { return };
+        let target = self.find_target.get();
+        let tab = if target == 0 {
+            self.request_tab.get()
+        } else {
+            self.response_tab.get()
+        };
+        if self.selected.get().is_none() || tab == Inspector::Hex {
+            set_text(
+                c.find_info,
+                "Select a session and Headers, Text or JSON; search is preview-only.",
+            );
+            return;
+        }
+        let query = text(c.find_query);
+        if query.is_empty() {
+            self.find_cursor.set(None);
+            // SAFETY: Clear only the current inspector's stale search selection.
+            unsafe {
+                SendMessageW(
+                    if target == 0 { c.request } else { c.response },
+                    EM_SETSEL,
+                    0,
+                    0,
+                );
+            }
+            set_text(
+                c.find_info,
+                "Enter text; search is limited to this displayed preview.",
+            );
+            return;
+        }
+        let handle = if target == 0 { c.request } else { c.response };
+        let (value, capped) = {
+            let viewer = self.viewer_text.borrow();
+            let original = &viewer[target];
+            let mut end = original.len().min(inspect::PREVIEW_LIMIT);
+            while !original.is_char_boundary(end) {
+                end -= 1;
+            }
+            (original[..end].to_owned(), end < original.len())
+        };
+        let matches = troubleshoot::find_matches(&value, &query, checked(c.find_case));
+        let Some((index, wrapped)) =
+            troubleshoot::next_match(&matches.ranges, self.find_cursor.get(), backwards)
+        else {
+            self.find_cursor.set(None);
+            // SAFETY: Clear only our inspector's old match selection.
+            unsafe {
+                SendMessageW(handle, EM_SETSEL, 0, 0);
+            }
+            set_text(
+                c.find_info,
+                if capped {
+                    "Not found in first 2 MiB of displayed text; search limited."
+                } else {
+                    "Not found in displayed preview (not the whole capture)."
+                },
+            );
+            return;
+        };
+        let range = matches.ranges[index];
+        self.find_cursor.set(Some(range));
+        // SAFETY: Positions are mapped to UTF-16 offsets within this current edit text.
+        unsafe {
+            SendMessageW(handle, EM_SETSEL, range.0, range.1 as isize);
+            SendMessageW(handle, EM_SCROLLCARET, 0, 0);
+        }
+        set_text(
+            c.find_info,
+            &format!(
+                "{}: {} / {}{}{}; {}",
+                if target == 0 { "Request" } else { "Response" },
+                index + 1,
+                matches.ranges.len(),
+                if matches.limited {
+                    " (first 10000)"
+                } else {
+                    ""
+                },
+                if wrapped { " (wrapped)" } else { "" },
+                if capped {
+                    "first 2 MiB of displayed text only"
+                } else {
+                    "displayed preview only"
+                }
+            ),
+        );
+    }
+
+    fn find_key(&self, message: &MSG) -> bool {
+        if !self.find_open.get() || message.message != WM_KEYDOWN {
+            return false;
+        }
+        if message.wParam as u16 == VK_ESCAPE && self.main_tab.get() == 0 {
+            self.close_find();
+            return true;
+        }
+        if self.controls.get().is_none() || message.wParam as u16 != VK_RETURN {
+            return false;
+        }
+        // SAFETY: Read this UI thread's focus/key state and click only our focused
+        // native Find button. A modeless non-dialog window has no default-button ID.
+        unsafe {
+            let focus = GetFocus();
+            let id = GetDlgCtrlID(focus);
+            if [FIND_NEXT, FIND_PREVIOUS, FIND_CLOSE]
+                .map(i32::from)
+                .contains(&id)
+            {
+                SendMessageW(focus, BM_CLICK, 0, 0);
+                return true;
+            }
+            if !find_enter_search_control(id) {
+                return false;
+            }
+            self.find_step(GetKeyState(VK_SHIFT as i32) < 0);
+            true
+        }
+    }
     fn paint(&self) {
         let mut paint = PAINTSTRUCT::default();
         // SAFETY: BeginPaint/EndPaint bracket this UI-thread paint DC; helper routines restore selected objects.
@@ -1597,7 +2109,7 @@ impl App {
                 dc,
                 rect(width - s(116), s(24), width - s(20), s(49)),
                 if !self.active.get() && self.archive_name.borrow().is_some() {
-                    "SAZ ARCHIVE"
+                    "ARCHIVE"
                 } else {
                     capture_badge(
                         self.demo.get(),
@@ -1623,7 +2135,12 @@ impl App {
             );
             fill(
                 dc,
-                rect(s(15), s(193), split - s(10), height - s(42)),
+                rect(
+                    s(15),
+                    s(list_top(split >= s(460)) - 1),
+                    split - s(10),
+                    height - s(42),
+                ),
                 BORDER,
             );
             fill(
@@ -1637,10 +2154,15 @@ impl App {
                 WHITE,
             );
             if self.main_tab.get() == 0 {
-                let available = (height - s(286) - s(109)).max(s(100));
-                let response_y = s(286) + (available as f64 * 0.43) as i32 + s(15);
+                let find_height = if self.find_open.get() { s(80) } else { 0 };
+                let available = (height - s(286) - find_height - s(109)).max(s(100));
+                let response_y = s(286) + find_height + (available as f64 * 0.43) as i32 + s(15);
                 for (y, title, info) in [
-                    (s(229), "REQUEST", self.request_info.borrow().clone()),
+                    (
+                        s(229) + find_height,
+                        "REQUEST",
+                        self.request_info.borrow().clone(),
+                    ),
                     (response_y, "RESPONSE", self.response_info.borrow().clone()),
                 ] {
                     label(
@@ -1751,6 +2273,17 @@ impl App {
             let header = &*(lparam as *const NMHDR);
             if header.hwndFrom == c.list {
                 match header.code {
+                    LVN_GETINFOTIPW => {
+                        let info = &mut *(lparam as *mut NMLVGETINFOTIPW);
+                        if let Some(row) = self.rows.borrow().get(info.iItem as usize) {
+                            copy_wide(
+                                &troubleshoot::reason(row),
+                                info.pszText,
+                                info.cchTextMax.max(0) as usize,
+                            );
+                        }
+                        return Some(0);
+                    }
                     LVN_GETDISPINFOW => {
                         let info = &mut *(lparam as *mut NMLVDISPINFOW);
                         if info.item.mask & LVIF_TEXT != 0 {
@@ -1807,25 +2340,102 @@ impl App {
                     }
                     NM_CUSTOMDRAW => {
                         let draw = &mut *(lparam as *mut NMLVCUSTOMDRAW);
+                        if self.high_contrast.get()
+                            && draw.nmcd.dwDrawStage == CDDS_ITEMPREPAINT | CDDS_SUBITEM
+                            && draw.nmcd.uItemState & CDIS_SELECTED == 0
+                        {
+                            draw.clrText = GetSysColor(COLOR_WINDOWTEXT);
+                            draw.clrTextBk = GetSysColor(COLOR_WINDOW);
+                            return Some(if draw.iSubItem == 1 {
+                                CDRF_NOTIFYPOSTPAINT as isize
+                            } else {
+                                CDRF_DODEFAULT as isize
+                            });
+                        }
                         match draw.nmcd.dwDrawStage {
+                            stage if stage == CDDS_ITEMPOSTPAINT | CDDS_SUBITEM => {
+                                if draw.iSubItem == 1
+                                    && self
+                                        .rows
+                                        .borrow()
+                                        .get(draw.nmcd.dwItemSpec)
+                                        .is_some_and(troubleshoot::problem_marker)
+                                {
+                                    let mut bounds = RECT {
+                                        top: 1,
+                                        left: LVIR_BOUNDS as i32,
+                                        ..Default::default()
+                                    };
+                                    if SendMessageW(
+                                        c.list,
+                                        LVM_GETSUBITEMRECT,
+                                        draw.nmcd.dwItemSpec,
+                                        &mut bounds as *mut RECT as isize,
+                                    ) != 0
+                                        && bounds.right - bounds.left >= self.s(64)
+                                    {
+                                        let size = self.s(16).min(bounds.bottom - bounds.top);
+                                        let saved = SaveDC(draw.nmcd.hdc);
+                                        if saved != 0 {
+                                            IntersectClipRect(
+                                                draw.nmcd.hdc,
+                                                bounds.left,
+                                                bounds.top,
+                                                bounds.right,
+                                                bounds.bottom,
+                                            );
+                                            // Shared stock icon: no font dependency or owned handle to destroy.
+                                            DrawIconEx(
+                                                draw.nmcd.hdc,
+                                                bounds.right - size - self.s(6),
+                                                bounds.top
+                                                    + (bounds.bottom - bounds.top - size) / 2,
+                                                LoadIconW(null_mut(), IDI_ERROR),
+                                                size,
+                                                size,
+                                                0,
+                                                null_mut(),
+                                                DI_NORMAL,
+                                            );
+                                            RestoreDC(draw.nmcd.hdc, saved);
+                                        }
+                                    }
+                                }
+                                return Some(CDRF_DODEFAULT as isize);
+                            }
                             CDDS_PREPAINT => return Some(CDRF_NOTIFYITEMDRAW as isize),
                             CDDS_ITEMPREPAINT => return Some(CDRF_NOTIFYSUBITEMDRAW as isize),
                             stage if stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM => {
-                                if let Some(row) = self.rows.borrow().get(draw.nmcd.dwItemSpec)
-                                    && draw.nmcd.uItemState & CDIS_SELECTED == 0
+                                let selected = SendMessageW(
+                                    c.list,
+                                    LVM_GETITEMSTATE,
+                                    draw.nmcd.dwItemSpec,
+                                    LVIS_SELECTED as isize,
+                                ) & LVIS_SELECTED as isize
+                                    != 0;
+                                if !selected
+                                    && let Some(row) = self.rows.borrow().get(draw.nmcd.dwItemSpec)
+                                    && troubleshoot::problem_marker(row)
+                                    && draw_error_cell(c.list, draw, row, self.dpi.get())
                                 {
-                                    draw.clrTextBk = if draw.nmcd.dwItemSpec.is_multiple_of(2) {
+                                    // Explorer's themed default pass must not repaint our red glyphs.
+                                    return Some(CDRF_SKIPDEFAULT as isize);
+                                }
+                                if let Some(row) = self.rows.borrow().get(draw.nmcd.dwItemSpec)
+                                    && !selected
+                                {
+                                    let problem = problem_row_colors(row, false, false);
+                                    draw.clrTextBk = if let Some((_, background)) = problem {
+                                        background
+                                    } else if draw.nmcd.dwItemSpec.is_multiple_of(2) {
                                         WHITE
                                     } else {
                                         rgb(249, 251, 252)
                                     };
-                                    draw.clrText = if draw.iSubItem == 1 {
-                                        if row.is_error() {
-                                            RED
-                                        } else if row
-                                            .status
-                                            .is_some_and(|s| (300..400).contains(&s))
-                                        {
+                                    draw.clrText = if let Some((foreground, _)) = problem {
+                                        foreground
+                                    } else if draw.iSubItem == 1 {
+                                        if row.status.is_some_and(|s| (300..400).contains(&s)) {
                                             AMBER
                                         } else {
                                             ACCENT
@@ -1836,7 +2446,11 @@ impl App {
                                         TEXT
                                     };
                                 }
-                                return Some(CDRF_DODEFAULT as isize);
+                                return Some(if draw.iSubItem == 1 {
+                                    (CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT) as isize
+                                } else {
+                                    CDRF_NEWFONT as isize
+                                });
                             }
                             _ => {}
                         }
@@ -1849,6 +2463,8 @@ impl App {
                         .set(SendMessageW(c.main_tabs, TCM_GETCURSEL, 0, 0) as usize);
                     self.layout();
                 } else if header.hwndFrom == c.request_tabs {
+                    self.select_find_pane(0);
+                    self.find_cursor.set(None);
                     self.request_tab.set(tab_kind(SendMessageW(
                         c.request_tabs,
                         TCM_GETCURSEL,
@@ -1856,6 +2472,8 @@ impl App {
                         0,
                     )));
                 } else if header.hwndFrom == c.response_tabs {
+                    self.select_find_pane(1);
+                    self.find_cursor.set(None);
                     self.response_tab.set(tab_kind(SendMessageW(
                         c.response_tabs,
                         TCM_GETCURSEL,
@@ -1943,7 +2561,7 @@ pub fn run(demo: bool, initial_archive: Option<PathBuf>) -> Result<()> {
     }
     let app = Box::new(App::new(demo)?);
     let class = wide("Juan.NativeDesktop");
-    let menu = make_menu()?;
+    let menu = make_menu(&app.recent.borrow())?;
     // SAFETY: The Box keeps App at a stable address until after WM_NCDESTROY and the message loop ends.
     unsafe {
         let instance = GetModuleHandleW(null());
@@ -1996,6 +2614,21 @@ pub fn run(demo: bool, initial_archive: Option<PathBuf>) -> Result<()> {
         let accelerators = [
             ACCEL {
                 fVirt: FVIRTKEY | FCONTROL,
+                key: b'F' as u16,
+                cmd: FIND,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY,
+                key: VK_F3,
+                cmd: FIND_NEXT,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY | FSHIFT,
+                key: VK_F3,
+                cmd: FIND_PREVIOUS,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY | FCONTROL,
                 key: b'O' as u16,
                 cmd: IMPORT_SAZ,
             },
@@ -2040,6 +2673,10 @@ pub fn run(demo: bool, initial_archive: Option<PathBuf>) -> Result<()> {
         }
         ShowWindow(hwnd, SW_SHOWNORMAL);
         UpdateWindow(hwnd);
+        let recent_warning = app.recent_warning.borrow_mut().take();
+        if let Some(warning) = recent_warning {
+            app.report(anyhow::anyhow!(warning));
+        }
         if let Some(path) = initial_archive
             && let Err(error) = app.begin_import(path, false)
         {
@@ -2057,7 +2694,8 @@ pub fn run(demo: bool, initial_archive: Option<PathBuf>) -> Result<()> {
                     std::io::Error::last_os_error()
                 ));
             }
-            if TranslateAcceleratorW(hwnd, accelerator, &message) == 0
+            if !app.find_key(&message)
+                && TranslateAcceleratorW(hwnd, accelerator, &message) == 0
                 && IsDialogMessageW(hwnd, &message) == 0
             {
                 TranslateMessage(&message);
@@ -2101,6 +2739,12 @@ unsafe extern "system" fn window_proc(
         }
         let app = &*pointer;
         match message {
+            WM_SETTINGCHANGE => {
+                app.refresh_high_contrast();
+                if let Some(c) = app.controls.get() {
+                    InvalidateRect(c.list, null(), 1);
+                }
+            }
             WM_CREATE => match app.initialize() {
                 Ok(()) => return 0,
                 Err(error) => {
@@ -2148,10 +2792,19 @@ unsafe extern "system" fn window_proc(
                 let code = ((wparam >> 16) & 0xffff) as u32;
                 if id == SEARCH && code == EN_CHANGE {
                     app.filter_changed();
+                } else if id == FIND_QUERY && code == EN_CHANGE {
+                    app.find_cursor.set(None);
+                    if app.find_open.get() {
+                        app.find_step(false);
+                    }
+                } else if (id == REQUEST_BODY || id == RESPONSE_BODY) && code == EN_SETFOCUS {
+                    let target = if id == REQUEST_BODY { 0 } else { 1 };
+                    app.select_find_pane(target);
                 } else if id == SCOPE && code == CBN_SELCHANGE {
                     if let Some(c) = app.controls.get() {
                         app.scope
                             .set(SendMessageW(c.scope, CB_GETCURSEL, 0, 0) as usize);
+                        app.review_cursor.set(None);
                         app.refresh(true);
                     }
                 } else if code == 0 || code == 1 {
@@ -2163,6 +2816,19 @@ unsafe extern "system" fn window_proc(
                 if let Some(result) = app.notify(lparam) {
                     return result;
                 }
+            }
+            WM_NEXTDLGCTL => {
+                // This is a modeless top-level window, not a dialog using DefDlgProc.
+                // Honor native dialog focus requests before routing Enter by focus.
+                let target = if lparam != 0 {
+                    wparam as HWND
+                } else {
+                    GetNextDlgTabItem(hwnd, GetFocus(), (wparam != 0) as i32)
+                };
+                if !target.is_null() && IsChild(hwnd, target) != 0 {
+                    SetFocus(target);
+                }
+                return 0;
             }
             WM_TIMER => {
                 app.tick();
@@ -2331,6 +2997,105 @@ fn empty_capture_message(active: bool, recording: bool, routed: bool, port: &str
     }
 }
 
+fn find_enter_search_control(id: i32) -> bool {
+    [FIND_QUERY, REQUEST_BODY, RESPONSE_BODY]
+        .into_iter()
+        .any(|control| i32::from(control) == id)
+}
+
+fn list_top(wide: bool) -> i32 {
+    if wide { 218 } else { 248 }
+}
+
+fn high_contrast_enabled(query_succeeded: bool, flags: u32) -> bool {
+    !query_succeeded || flags & HCF_HIGHCONTRASTON != 0
+}
+
+fn problem_row_colors(
+    row: &SessionSummary,
+    selected: bool,
+    high_contrast: bool,
+) -> Option<(u32, u32)> {
+    (troubleshoot::problem_marker(row) && !selected && !high_contrast)
+        .then_some((RED, rgb(255, 238, 238)))
+}
+
+fn draw_error_cell(list: HWND, draw: &NMLVCUSTOMDRAW, row: &SessionSummary, dpi: u32) -> bool {
+    let column = draw.iSubItem;
+    if column < 0 || column as usize >= COLUMNS.len() {
+        return false;
+    }
+    // SAFETY: The list and paint DC are live during NM_CUSTOMDRAW. Buffers are local;
+    // the saved DC is restored and the only owned GDI brush is deleted before return.
+    unsafe {
+        let mut bounds = RECT {
+            top: column,
+            left: LVIR_BOUNDS as i32,
+            ..Default::default()
+        };
+        if SendMessageW(
+            list,
+            LVM_GETSUBITEMRECT,
+            draw.nmcd.dwItemSpec,
+            &mut bounds as *mut RECT as isize,
+        ) == 0
+        {
+            return false;
+        }
+        // Subitem zero's bounds cover the entire row, unlike the other subitems.
+        if column == 0 {
+            bounds.right = bounds.left + SendMessageW(list, LVM_GETCOLUMNWIDTH, 0, 0) as i32;
+        }
+        let dc = draw.nmcd.hdc;
+        let saved = SaveDC(dc);
+        if saved == 0 {
+            return false;
+        }
+        IntersectClipRect(dc, bounds.left, bounds.top, bounds.right, bounds.bottom);
+        let brush = CreateSolidBrush(rgb(255, 238, 238));
+        if brush.is_null() {
+            RestoreDC(dc, saved);
+            return false;
+        }
+        FillRect(dc, &bounds, brush);
+        DeleteObject(brush);
+        let font = SendMessageW(list, WM_GETFONT, 0, 0) as HFONT;
+        if !font.is_null() {
+            SelectObject(dc, font);
+        }
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(dc, RED);
+        let mut text_bounds = bounds;
+        text_bounds.left += scaled(6, dpi);
+        text_bounds.right -= scaled(6, dpi);
+        if column == 1 && bounds.right - bounds.left >= scaled(64, dpi) {
+            let size = scaled(16, dpi).min(bounds.bottom - bounds.top);
+            text_bounds.right -= size + scaled(4, dpi);
+            DrawIconEx(
+                dc,
+                bounds.right - size - scaled(6, dpi),
+                bounds.top + (bounds.bottom - bounds.top - size) / 2,
+                LoadIconW(null_mut(), IDI_ERROR),
+                size,
+                size,
+                0,
+                null_mut(),
+                DI_NORMAL,
+            );
+        }
+        let text = wide(&cell_text(row, column as usize));
+        DrawTextW(
+            dc,
+            text.as_ptr(),
+            (text.len() - 1) as i32,
+            &mut text_bounds,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        RestoreDC(dc, saved);
+        true
+    }
+}
+
 fn cell_text(row: &SessionSummary, column: usize) -> String {
     match column {
         0 => row.id.to_string(),
@@ -2378,7 +3143,7 @@ fn compare_rows(a: &SessionSummary, b: &SessionSummary, column: usize) -> Orderi
     }
 }
 
-fn make_menu() -> Result<HMENU> {
+fn make_menu(recent: &super::recent::RecentFiles) -> Result<HMENU> {
     // SAFETY: Ownership of the completed menu tree transfers to the main window.
     unsafe {
         let menu = CreateMenu();
@@ -2388,7 +3153,7 @@ fn make_menu() -> Result<HMENU> {
                 (
                     "&File",
                     vec![
-                        (IMPORT_SAZ, "Open SAZ...\tCtrl+O"),
+                        (IMPORT_SAZ, "Open HAR or SAZ...\tCtrl+O"),
                         (EXPORT_SAZ, "Save SAZ (sensitive)..."),
                         (EXPORT_SAZ_SANITIZED, "Save sanitized SAZ..."),
                         (0, ""),
@@ -2406,6 +3171,16 @@ fn make_menu() -> Result<HMENU> {
                         (0, ""),
                         (CLEAR, "Clear sessions\tCtrl+Delete"),
                         (FOCUS_SEARCH, "Focus filter\tCtrl+L"),
+                    ],
+                ),
+                (
+                    "&View",
+                    vec![
+                        (FIND, "Find in message...\tCtrl+F"),
+                        (FIND_NEXT, "Next message match\tF3"),
+                        (FIND_PREVIOUS, "Previous message match\tShift+F3"),
+                        (0, ""),
+                        (REVIEW_FIRST, "Review next visible candidate"),
                     ],
                 ),
                 (
@@ -2454,6 +3229,80 @@ fn make_menu() -> Result<HMENU> {
             DestroyMenu(menu);
             return Err(error);
         }
+        let file = GetSubMenu(menu, 0);
+        let history = match make_recent_menu(recent) {
+            Ok(history) => history,
+            Err(error) => {
+                DestroyMenu(menu);
+                return Err(error);
+            }
+        };
+        if InsertMenuW(
+            file,
+            1,
+            MF_BYPOSITION | MF_POPUP,
+            history as usize,
+            wide("&Recent files").as_ptr(),
+        ) == 0
+        {
+            DestroyMenu(history);
+            DestroyMenu(menu);
+            bail!("Attach recent-file menu");
+        }
+        Ok(menu)
+    }
+}
+
+fn make_recent_menu(recent: &super::recent::RecentFiles) -> Result<HMENU> {
+    // SAFETY: This function exclusively owns the menu until returning it; every
+    // error destroys it and successful callers attach it to the window's menu.
+    unsafe {
+        let menu = CreatePopupMenu();
+        ensure!(!menu.is_null(), "Create recent-file menu");
+        let result = (|| -> Result<()> {
+            if recent.paths().is_empty() {
+                ensure!(
+                    AppendMenuW(
+                        menu,
+                        MF_STRING | MF_GRAYED,
+                        0,
+                        wide("(No recent files)").as_ptr()
+                    ) != 0,
+                    "Create empty history label"
+                );
+            }
+            for (index, path) in recent.paths().iter().enumerate() {
+                let label = super::recent::menu_label(path, index);
+                ensure!(
+                    AppendMenuW(
+                        menu,
+                        MF_STRING,
+                        RECENT_FIRST as usize + index,
+                        wide(&label).as_ptr()
+                    ) != 0,
+                    "Create recent-file entry"
+                );
+            }
+            ensure!(
+                AppendMenuW(menu, MF_SEPARATOR, 0, null()) != 0,
+                "Create history separator"
+            );
+            // Always available, even after a corrupt history failed to load.
+            ensure!(
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    CLEAR_RECENT as usize,
+                    wide("&Clear history").as_ptr()
+                ) != 0,
+                "Create clear history command"
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            DestroyMenu(menu);
+            return Err(error);
+        }
         Ok(menu)
     }
 }
@@ -2461,6 +3310,81 @@ fn make_menu() -> Result<HMENU> {
 #[cfg(test)]
 mod capture_start_tests {
     use super::*;
+
+    #[test]
+    fn list_geometry_and_contrast_fallback_are_consistent() {
+        assert_eq!(list_top(true), 218);
+        assert_eq!(list_top(false), 248);
+        assert!(!high_contrast_enabled(true, 0));
+        assert!(high_contrast_enabled(true, HCF_HIGHCONTRASTON));
+        assert!(high_contrast_enabled(false, 0));
+        assert!(high_contrast_enabled(false, HCF_HIGHCONTRASTON));
+    }
+
+    #[test]
+    fn file_menu_contains_recent_archive_commands_and_clear_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capture.har");
+        std::fs::write(&path, "{}").unwrap();
+        let mut recent = super::super::recent::RecentFiles::empty(directory.path());
+        recent.record_success(&path).unwrap();
+        let menu = make_menu(&recent).unwrap();
+        // SAFETY: This test owns the unattached menu tree and destroys it once.
+        unsafe {
+            let file = GetSubMenu(menu, 0);
+            let history = GetSubMenu(file, 1);
+            assert_eq!(GetMenuItemCount(history), 3);
+            assert_eq!(GetMenuItemID(history, 0), RECENT_FIRST as u32);
+            assert_eq!(GetMenuItemID(history, 2), CLEAR_RECENT as u32);
+            DestroyMenu(menu);
+        }
+    }
+
+    #[test]
+    fn find_enter_preserves_native_button_actions() {
+        for id in [FIND_QUERY, REQUEST_BODY, RESPONSE_BODY] {
+            assert!(find_enter_search_control(i32::from(id)));
+        }
+        for id in [FIND_NEXT, FIND_PREVIOUS, FIND_CLOSE, FIND_CASE, SEARCH, 0] {
+            assert!(!find_enter_search_control(i32::from(id)));
+        }
+        assert!(!find_enter_search_control(-1));
+    }
+
+    #[test]
+    fn problem_cells_are_compact_with_reasons_in_details_and_accessible_colors() {
+        let imported = crate::har_import::read(
+            include_bytes!("../../tests/fixtures/har/troubleshooting.har").as_slice(),
+            crate::capture::CaptureLimits::default(),
+        )
+        .unwrap();
+        let rows: Vec<_> = imported.sessions.iter().map(|s| s.summary()).collect();
+        assert_eq!(cell_text(&rows[5], 1), "403");
+        assert_eq!(cell_text(&rows[6], 1), "429");
+        assert_eq!(cell_text(&rows[7], 1), "500");
+        assert_eq!(cell_text(&rows[8], 1), "401");
+        assert_eq!(cell_text(&rows[10], 1), "200");
+        assert!(troubleshoot::reason(&rows[9]).contains("recorded transport/source error"));
+        for row in &rows {
+            assert_eq!(
+                problem_row_colors(row, false, false).is_some(),
+                troubleshoot::problem_marker(row)
+            );
+            assert_eq!(problem_row_colors(row, true, false), None);
+            assert_eq!(problem_row_colors(row, false, true), None);
+        }
+        let mut row = rows[0].clone();
+        for status in 400..=599 {
+            row.status = Some(status);
+            assert_eq!(cell_text(&row, 1), status.to_string());
+            assert_eq!(
+                problem_row_colors(&row, false, false),
+                Some((RED, rgb(255, 238, 238)))
+            );
+        }
+        row.status = Some(400);
+        assert_eq!(troubleshoot::reason(&row), "400 Bad Request");
+    }
 
     #[test]
     fn routing_requires_an_explicit_choice_and_cancel_does_not_default_to_capture() {
