@@ -6,13 +6,19 @@ Juan combines a classic session-list / inspector workflow with a small Rust
 application, native Win32 controls, and explicit capture and trust controls.
 There is no webview, embedded browser, account, cloud service, or telemetry.
 
-**Version 0.3.1 is an initial working developer preview, not full Fiddler feature
+**Version 0.4.0 is a working developer preview, not full Fiddler feature
 parity.** It is an independent implementation with original branding and assets,
 not affiliated with or endorsed by Fiddler or its owners.
 
 ![Juan desktop showing synthetic demo traffic](docs/juan.png)
 
 The screenshot uses synthetic `.test` domains and a visibly fake token.
+
+Version 0.4.0 adds offline **HAR 1.2 import** in the desktop and CLI (128 MiB
+input limit; unsupported entries are skipped with warnings), troubleshooting
+views (**Hide assets**, red error rows, **Review first**, and **Ctrl+F** message
+search), a **File > Recent files** menu, and export confirmations that report
+visible and excluded session counts.
 
 Version 0.3.1 fixes upstream HTTP/2 resets on origins such as Google. Outbound
 authority is now generated from the target URI by the HTTP client: `Host` for
